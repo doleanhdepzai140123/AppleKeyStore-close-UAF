@@ -272,7 +272,7 @@ static int run_attempt(void) {
         [subtitle.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:20],
         [subtitle.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-20],
         [self.triggerButton.topAnchor constraintEqualToAnchor:subtitle.bottomAnchor constant:24],
-        [self.triggerButton.centerXAnchor constraintEqualToAnchor:self.view.centerXAhor],
+        [self.triggerButton.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
         [self.triggerButton.widthAnchor constraintEqualToConstant:280],
         [self.triggerButton.heightAnchor constraintEqualToConstant:56],
         [self.statusLabel.topAnchor constraintEqualToAnchor:self.triggerButton.bottomAnchor constant:16],
