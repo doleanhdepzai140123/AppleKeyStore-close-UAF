@@ -1,0 +1,36 @@
+name: Build PoC for iOS
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: macos-26 # Dùng macOS mới nhất của Github
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Xcode
+        # Đảm bảo dùng Xcode 16+ để hỗ trợ iOS 26 SDK
+        run: sudo xcode-select -s /Applications/Xcode_26.app 
+
+      - name: Build App
+        run: |
+          cd PoC
+          xcodebuild -project UAFTester.xcodeproj \
+                     -scheme UAFTester \
+                     -configuration Release \
+                     -sdk iphoneos \
+                     -derivedDataPath build \
+                     CODE_SIGNING_ALLOWED=NO \
+                     CODE_SIGN_ING_REQUIRED=NO
+
+      - name: Create IPA (Fake Sign)
+        run: |
+          mkdir -p Payload
+          cp -r PoC/build/Build/Products/Release-iphoneos/UAFTester.app Payload/
+          zip -r UAFTester.ipa Payload
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: UAFTester-IPA
+          path: UAFTester.ipa
