@@ -11,7 +11,7 @@ jobs:
       - name: Set up Xcode
         run: |
           # Chọn Xcode 16 (mới nhất) để hỗ trợ iOS 26.2.1
-          sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
+          sudo xcode-select -s /Applications/Xcode_26.app/Contents/Developer
           xcodebuild -version
 
       - name: Build App (Bypass Signing)
