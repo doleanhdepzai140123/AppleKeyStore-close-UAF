@@ -3,19 +3,20 @@ on: [push, workflow_dispatch]
 
 jobs:
   build:
-    runs-on: macos-26 # Dùng macOS mới nhất của Github
+    runs-on: macos-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Select Highest Xcode Version
-              run: |
-                # Liệt kê các bản Xcode có sẵn để cậu dễ debug nếu lỗi lại xảy ra
-                ls /Applications/ | grep Xcode
-                # Tự động chọn bản Xcode mới nhất có trên máy
-                latest_xcode=$(ls /Applications/ | grep Xcode_ | sort -V | tail -n 1)
-                sudo xcode-select -s "/Applications/$latest_xcode/Contents/Developer"
-                xcodebuild -version
+      - name: Set up Xcode
+        run: |
+          # Liệt kê để kiểm tra các bản Xcode hiện có
+          ls /Applications/ | grep Xcode
+          # Tự động chọn bản Xcode mới nhất
+          LATEST_XCODE=$(ls /Applications/ | grep Xcode_ | sort -V | tail -n 1)
+          echo "Using Xcode: $LATEST_XCODE"
+          sudo xcode-select -s "/Applications/$LATEST_XCODE/Contents/Developer"
+          xcodebuild -version
 
       - name: Build App
         run: |
@@ -26,12 +27,14 @@ jobs:
                      -sdk iphoneos \
                      -derivedDataPath build \
                      CODE_SIGNING_ALLOWED=NO \
-                     CODE_SIGN_ING_REQUIRED=NO
+                     CODE_SIGNING_REQUIRED=NO
 
       - name: Create IPA (Fake Sign)
         run: |
           mkdir -p Payload
-          cp -r PoC/build/Build/Products/Release-iphoneos/UAFTester.app Payload/
+          # Tìm đường dẫn app vừa build xong
+          APP_PATH=$(find PoC/build -name "*.app" -type d | head -n 1)
+          cp -r "$APP_PATH" Payload/
           zip -r UAFTester.ipa Payload
 
       - name: Upload Artifact
