@@ -1,54 +1,38 @@
-name: Build PoC for iOS
-on: [push, workflow_dispatch]
+name: Build IPA
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-26
+    
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Xcode (Auto-Detect)
-        run: |
-          # Liệt kê các bản Xcode hiện có để debug nếu cần
-          ls -d /Applications/Xcode_*.app
-          # Lấy bản Xcode mới nhất hiện có trên runner macos-15
-          XCODE_PATH=$(ls -d /Applications/Xcode_*.app | sort -V | tail -n 1)
-          sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
-          echo "✅ Đang sử dụng: $(xcodebuild -version | head -n 1)"
-
-      - name: Build App (Ultra Bypass)
-        run: |
-          cd PoC
-          xcodebuild clean build \
-            -project UAFTester.xcodeproj \
-            -scheme UAFTester \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath ./DerivedData \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGN_ENTITLEMENTS="" \
-            GCC_WARN_INHIBIT_ALL_WARNINGS=YES \
-            COMPILER_INDEX_STORE_ENABLE=NO
-      - name: Package IPA
-        run: |
-          mkdir -p Payload
-          # Tìm file .app một cách chính xác
-          APP_DIR=$(find PoC/DerivedData -name "UAFTester.app" -type d | head -n 1)
-          
-          if [ -z "$APP_DIR" ]; then
-            echo "❌ LỖI: Không tìm thấy file .app sau khi build!"
-            exit 1
-          fi
-          
-          cp -r "$APP_DIR" Payload/
-          zip -r UAFTester.ipa Payload
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: UAFTester-IPA
-          path: UAFTester.ipa
+    - uses: actions/checkout@v3
+    
+    - name: Setup Xcode
+      run: sudo xcode-select -s /Applications/Xcode.app
+    
+    - name: Build
+      run: |
+        cd PoC
+        xcodebuild -project UAFTester.xcodeproj \
+                   -scheme UAFTester \
+                   -configuration Release \
+                   -archivePath UAFTester.xcarchive \
+                   archive
+        
+        xcodebuild -exportArchive \
+                   -archivePath UAFTester.xcarchive \
+                   -exportPath output \
+                   -exportOptionsPlist exportOptions.plist
+    
+    - name: Upload IPA
+      uses: actions/upload-artifact@v3
+      with:
+        name: UAFTester-IPA
+        path: PoC/output/*.ipa
