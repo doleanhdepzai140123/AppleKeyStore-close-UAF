@@ -32,7 +32,7 @@ jobs:
                    -exportOptionsPlist exportOptions.plist
     
     - name: Upload IPA
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: UAFTester-IPA
         path: PoC/output/*.ipa
