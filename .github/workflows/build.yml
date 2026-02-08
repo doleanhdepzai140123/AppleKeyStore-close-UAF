@@ -8,16 +8,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Xcode
+      - name: Set up Xcode (Auto-Detect)
         run: |
-          # Chọn Xcode 16 (mới nhất) để hỗ trợ iOS 26.2.1
-          sudo xcode-select -s /Applications/Xcode_26.app/Contents/Developer
-          xcodebuild -version
+          # Liệt kê các bản Xcode hiện có để debug nếu cần
+          ls -d /Applications/Xcode_*.app
+          # Lấy bản Xcode mới nhất hiện có trên runner macos-15
+          XCODE_PATH=$(ls -d /Applications/Xcode_*.app | sort -V | tail -n 1)
+          sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
+          echo "✅ Đang sử dụng: $(xcodebuild -version | head -n 1)"
 
       - name: Build App (Bypass Signing)
         run: |
           cd PoC
-          # Clean và Build cùng lúc, ép không ký code để tránh lỗi 65
           xcodebuild clean build \
             -project UAFTester.xcodeproj \
             -scheme UAFTester \
@@ -28,18 +30,17 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             AD_HOC_CODE_SIGNING_ALLOWED=YES
 
-      - name: Package IPA (Manual Layout)
+      - name: Package IPA
         run: |
           mkdir -p Payload
-          # Tìm file .app một cách chính xác nhất
+          # Tìm file .app một cách chính xác
           APP_DIR=$(find PoC/DerivedData -name "UAFTester.app" -type d | head -n 1)
           
           if [ -z "$APP_DIR" ]; then
-            echo "❌ Không tìm thấy file .app! Kiểm tra lại quá trình build."
+            echo "❌ LỖI: Không tìm thấy file .app sau khi build!"
             exit 1
           fi
           
-          echo "✅ Đã tìm thấy app tại: $APP_DIR"
           cp -r "$APP_DIR" Payload/
           zip -r UAFTester.ipa Payload
 
