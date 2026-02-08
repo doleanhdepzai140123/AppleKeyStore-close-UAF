@@ -17,7 +17,7 @@ jobs:
           sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
           echo "✅ Đang sử dụng: $(xcodebuild -version | head -n 1)"
 
-      - name: Build App (Bypass Signing)
+      - name: Build App (Ultra Bypass)
         run: |
           cd PoC
           xcodebuild clean build \
@@ -28,8 +28,10 @@ jobs:
             -derivedDataPath ./DerivedData \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES
-
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            GCC_WARN_INHIBIT_ALL_WARNINGS=YES \
+            COMPILER_INDEX_STORE_ENABLE=NO
       - name: Package IPA
         run: |
           mkdir -p Payload
