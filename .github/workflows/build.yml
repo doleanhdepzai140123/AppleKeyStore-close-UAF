@@ -14,25 +14,34 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     
-    - name: Setup Xcode
-      run: sudo xcode-select -s /Applications/Xcode.app
-    
-    - name: Build
+    - name: Build App Binary
       run: |
         cd PoC
-        xcodebuild -project UAFTester.xcodeproj \
-                   -scheme UAFTester \
-                   -configuration Release \
-                   -archivePath UAFTester.xcarchive \
-                   archive
-        
-        xcodebuild -exportArchive \
-                   -archivePath UAFTester.xcarchive \
-                   -exportPath output \
-                   -exportOptionsPlist exportOptions.plist
-    
+        # Build ra file .app mà không cần chữ ký (Bypass Signing)
+        xcodebuild build \
+          -project UAFTester.xcodeproj \
+          -scheme UAFTester \
+          -configuration Release \
+          -sdk iphoneos \
+          -derivedDataPath build_output \
+          CODE_SIGNING_ALLOWED=NO \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGN_IDENTITY="" \
+          AD_HOC_CODE_SIGNING_ALLOWED=YES
+
+    - name: Create IPA (Manual Packaging)
+      run: |
+        cd PoC
+        mkdir -p Payload
+        # Tìm file .app vừa build xong và copy vào thư mục Payload
+        APP_PATH=$(find build_output -name "*.app" -type d | head -n 1)
+        echo "Found App at: $APP_PATH"
+        cp -r "$APP_PATH" Payload/
+        # Nén thành file .ipa
+        zip -r UAFTester.ipa Payload
+
     - name: Upload IPA
       uses: actions/upload-artifact@v4
       with:
         name: UAFTester-IPA
-        path: PoC/output/*.ipa
+        path: PoC/UAFTester.ipa
