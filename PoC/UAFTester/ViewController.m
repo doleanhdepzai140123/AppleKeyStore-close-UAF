@@ -269,8 +269,8 @@ static void heap_spray_cleanup(void(^log_callback)(NSString *)) {
 // ==================================================================
 
 @interface ViewController ()
-@property (weak, nonatomic) IBOutlet UITextView *textView;
-@property (weak, nonatomic) IBOutlet UIButton *testButton;
+@property (strong, nonatomic) UITextView *textView;
+@property (strong, nonatomic) UIButton *testButton;
 @property (nonatomic, strong) NSMutableString *logBuffer;
 @end
 
@@ -278,20 +278,36 @@ static void heap_spray_cleanup(void(^log_callback)(NSString *)) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    
+    // 1. Cài đặt màu nền cho màn hình chính
+    self.view.backgroundColor = [UIColor blackColor];
+    
+    // 2. Tạo TextView để hiện Log
+    self.textView = [[UITextView alloc] initWithFrame:CGRectMake(10, 60, self.view.bounds.size.width - 20, self.view.bounds.size.height - 200)];
+    self.textView.backgroundColor = [UIColor colorWithWhite:0.1 alpha:1.0]; // Màu xám đen
+    self.textView.textColor = [UIColor greenColor]; // Chữ màu xanh lá cho giống hacker
+    self.textView.font = [UIFont fontWithName:@"Menlo" size:12.0];
+    self.textView.editable = NO;
+    self.textView.layer.cornerRadius = 10;
+    [self.view addSubview:self.textView];
+    
+    // 3. Tạo Button để chạy Test
+    self.testButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.testButton.frame = CGRectMake(20, self.view.bounds.size.height - 100, self.view.bounds.size.width - 40, 50);
+    [self.testButton setTitle:@"START EXPLOIT v3_debug" forState:UIControlStateNormal];
+    [self.testButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    self.testButton.backgroundColor = [UIColor systemRedColor];
+    self.testButton.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+    self.testButton.layer.cornerRadius = 12;
+    
+    // Kết nối nút bấm với hàm runTest:
+    [self.testButton addTarget:self action:@selector(runTest:) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.testButton];
+    
+    // 4. Khởi tạo buffer log
     self.logBuffer = [NSMutableString string];
-    [self appendLog:@"UAF Tester Ready (v3_debug - Enhanced Logging)"];
-    [self appendLog:@"This version includes extensive diagnostics"];
-}
-
-- (void)appendLog:(NSString *)msg {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self.logBuffer appendFormat:@"%@\n", msg];
-        self.textView.text = self.logBuffer;
-        
-        NSRange bottom = NSMakeRange(self.textView.text.length - 1, 1);
-        [self.textView scrollRangeToVisible:bottom];
-    });
-    NSLog(@"%@", msg);
+    [self appendLog:@"[SYSTEM] UAF Tester Ready (v3_debug)"];
+    [self appendLog:@"[SYSTEM] UI initialized programmatically."];
 }
 
 - (IBAction)runTest:(id)sender {
