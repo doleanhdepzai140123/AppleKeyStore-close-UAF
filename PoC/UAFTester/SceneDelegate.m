@@ -13,11 +13,12 @@
 willConnectToSession:(UISceneSession *)session 
       options:(UISceneConnectionOptions *)connectionOptions {
     
-    // Xcode 26.2 requires explicit type check and cast
     if (scene && [scene isKindOfClass:[UIWindowScene class]]) {
         UIWindowScene *windowScene = (UIWindowScene *)scene;
         self.window = [[UIWindow alloc] initWithWindowScene:windowScene];
-        // Window's root view controller is set by storyboard
+        UIStoryboard *sb = [UIStoryboard storyboardWithName:@"Main" bundle:nil];
+        self.window.rootViewController = [sb instantiateInitialViewController];
+        [self.window makeKeyAndVisible];
     }
 }
 
