@@ -47,7 +47,7 @@ typedef struct __attribute__((packed)) {
     uint64_t marker_0x128;
     uint64_t marker_0x130;
     uint64_t marker_0x138;
-    uint64_t pad2[110];
+    uint64_t pad2[88];
 } fake_gate_t;
 
 // Compile-time assertions
@@ -140,7 +140,7 @@ static void init_fake_gate(fake_gate_t *gate, int variant) {
     gate->marker_0x130 = 0x4646464646464646ULL;
     gate->marker_0x138 = 0x4747474747474747ULL;
     
-    for (int i = 0; i < 110; i++) {
+    for (int i = 0; i < 88; i++) {
         gate->pad2[i] = 0x3030303030303030ULL;
     }
 }
