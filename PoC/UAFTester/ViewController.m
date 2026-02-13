@@ -31,7 +31,7 @@ static atomic_uint  g_leaks  = 0;  // Count of potential leaks
 // Store leaked data
 #define MAX_LEAK_SAMPLES 100
 static uint64_t g_leaked_data[MAX_LEAK_SAMPLES][8];  // Store 64 bytes per sample
-static int g_leak_count = 0;
+static atomic_int g_leak_count = 0;  // FIXED: Make atomic for thread-safe access
 
 static void *racer_thread(void *arg) {
     (void)arg;
@@ -409,7 +409,7 @@ static void try_property_leak(void(^log_callback)(NSString *)) {
             [self appendLog:[NSString stringWithFormat:@"[*] Captured %d leak samples:", g_leak_count]];
             
             for (int i = 0; i < g_leak_count && i < 10; i++) {
-                [self appendLog:[NSString stringWithFormat:@""];
+                [self appendLog:@""];
                 [self appendLog:[NSString stringWithFormat:@"Sample #%d:", i + 1]];
                 for (int j = 0; j < 8; j++) {
                     uint64_t val = g_leaked_data[i][j];
