@@ -71,7 +71,8 @@ static void *racer_thread(void *arg) {
                     // Store the leak sample if we have space
                     int idx = atomic_load(&g_leak_count);
                     if (idx < MAX_LEAK_SAMPLES) {
-                        if (__sync_bool_compare_and_swap(&g_leak_count, idx, idx + 1)) {
+                        int expected = idx;
+                        if (atomic_compare_exchange_strong(&g_leak_count, &expected, idx + 1)) {
                             memcpy(g_leaked_data[idx], output, sizeof(output));
                         }
                     }
